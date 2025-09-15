@@ -1,0 +1,3 @@
+server/.env
+server/waviate_rag/env/
+server/waviate_rag/.venv/
