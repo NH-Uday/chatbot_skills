@@ -1,23 +1,34 @@
 import os
-from app.services.embedder import embed_and_store
-from app.services.weaviate_setup import init_schema, client
+import sys
+from dotenv import load_dotenv
 
+# allow imports
+sys.path.append(os.path.join(os.path.dirname(__file__), "app"))
 
-PDF_FOLDER = os.path.join(os.path.dirname(__file__), "docs")
+from app.services.weaviate_setup import init_schema, close_client  # type: ignore
+from app.services.embedder import embed_and_store  # type: ignore
 
-def load_all_pdfs():
-    if not os.path.exists(PDF_FOLDER):
-        print(f"❌ Folder not found: {PDF_FOLDER}")
-        return
+load_dotenv()
 
-    init_schema()
+PDF_DIR = os.getenv("PDF_DIR", os.path.join(os.path.dirname(__file__), "docs"))
 
-    for file in os.listdir(PDF_FOLDER):
-        if file.lower().endswith(".pdf"):
-            pdf_path = os.path.join(PDF_FOLDER, file)
-            embed_and_store(pdf_path)
-            
-    client.close()
+def main():
+    try:
+        init_schema()
+        if not os.path.exists(PDF_DIR):
+            print(f"❌ PDF folder not found: {PDF_DIR}")
+            return
+        pdfs = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
+        if not pdfs:
+            print(f"ℹ️ No PDFs in: {PDF_DIR}")
+            return
+        for name in pdfs:
+            path = os.path.join(PDF_DIR, name)
+            print(f"📥 Indexing: {path}")
+            embed_and_store(path)
+        print("✅ Done.")
+    finally:
+        close_client()
 
 if __name__ == "__main__":
-    load_all_pdfs()
+    main()

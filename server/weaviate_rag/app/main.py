@@ -1,13 +1,13 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
-from app.services.rag import retrieve_answer
 from fastapi.middleware.cors import CORSMiddleware
+from app.services.rag import retrieve_answer
 
-app = FastAPI()
+app = FastAPI(title="PDF RAG Chat", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can limit this to ["http://localhost:3000"] in production
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -17,7 +17,6 @@ class ChatRequest(BaseModel):
     question: str
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
+async def chat(req: ChatRequest):
     answer = retrieve_answer(req.question)
     return {"answer": answer}
-
