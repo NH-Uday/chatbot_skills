@@ -1,13 +1,18 @@
 import os
 import math
+from typing import Optional
 import pdfplumber
 from typing import List, Dict, Iterable
 from dotenv import load_dotenv
 from openai import OpenAI
 import tiktoken
 
-from app.services.weaviate_setup import init_schema, client
-from app.services.weaviate_setup import CLASS_NAME
+from app.services.weaviate_setup import (
+    ensure_collections,
+    get_collection,
+    class_from_key,
+    client,
+)
 from app.services.format_math_equation import format_equations_for_mathjax
 
 load_dotenv()
@@ -52,30 +57,47 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
     resp = oa.embeddings.create(model=OPENAI_EMBED_MODEL, input=texts)
     return [d.embedding for d in resp.data]
 
-def embed_and_store(pdf_path: str):
-    init_schema()
-    coll = client.collections.get(CLASS_NAME)
+def _target_class_from_env_or_key(target: Optional[str]) -> str:
+    if target:
+        t = target.strip()
+        if t.upper() in {"FB1", "FB2", "FB3"}:
+            return class_from_key(t.upper())
+        return t
+    return os.getenv("WEAVIATE_CLASS", "LectureChunk")
 
+def embed_and_store(pdf_path: str, target: Optional[str] = None):
+    """
+    Ingest a PDF into the chosen Weaviate collection.
+    `target` can be "FB1" | "FB2" | "FB3" or an exact class name.
+    If omitted, falls back to WEAVIATE_CLASS or 'LectureChunk'.
+    """
+    # Make sure all collections exist
+    ensure_collections()
+
+    # Pick collection at *runtime*
+    class_name = _target_class_from_env_or_key(target)
+    coll = get_collection(class_name)
+    print(f"[embedder] Inserting into: {class_name}")
+
+    # --- Read & chunk ---
     docs = _read_pdf(pdf_path)
     basename = os.path.basename(pdf_path)
 
-    # Build chunks with page metadata
     raw_chunks = []
     for d in docs:
-        for ch in _chunk_text(d["text"], model="gpt-4o-mini"):  # tokenization baseline
-            # normalize math for better downstream rendering
-            pretty = format_equations_for_mathjax(ch)
+        for ch in _chunk_text(d["text"], model="gpt-4o-mini"):  
+            pretty = format_equations_for_mathjax(ch)           
             raw_chunks.append({"text": pretty, "source": basename, "page": d["page"]})
 
     if not raw_chunks:
         print(f"⚠️ No text in {basename}")
         return
 
-    # Batch insert with manual vectors
+    # --- Embed & batch insert (manual vectors) ---
     batch_size = 64
     for i in range(0, len(raw_chunks), batch_size):
         batch = raw_chunks[i : i + batch_size]
-        vectors = _embed_texts([b["text"] for b in batch])
+        vectors = _embed_texts([b["text"] for b in batch])     
 
         with coll.batch.dynamic() as b:
             for item, vec in zip(batch, vectors):

@@ -1,24 +1,42 @@
-# app/services/weaviate_setup.py
 import os
 from urllib.parse import urlparse
 from pathlib import Path
+from typing import List, Tuple, Optional, Dict
+
 from dotenv import load_dotenv
 import weaviate
 from weaviate.classes.config import Property, DataType, Configure, VectorDistances
 
-# ----- Load .env from server/.env -----
+# ----- Load .env from server/.env (kept from your original) -----
 THIS_FILE = Path(__file__).resolve()
 ENV_PATH = THIS_FILE.parents[3] / ".env"   # server/.env
 load_dotenv(dotenv_path=str(ENV_PATH))
 
-CLASS_NAME = os.getenv("WEAVIATE_CLASS", "LectureChunk").strip()
+# ======= Multi-bot class names =======
+# You can override these in .env:
+#   WEAVIATE_CLASS_FB1=Chatbot_FB1
+#   WEAVIATE_CLASS_FB2=Chatbot_FB2
+#   WEAVIATE_CLASS_FB3=Chatbot_FB3
+CLASS_FB1 = (os.getenv("WEAVIATE_CLASS_FB1") or "Chatbot_FB1").strip()
+CLASS_FB2 = (os.getenv("WEAVIATE_CLASS_FB2") or "Chatbot_FB2").strip()
+CLASS_FB3 = (os.getenv("WEAVIATE_CLASS_FB3") or "Chatbot_FB3").strip()
 
+CLASS_NAMES: List[str] = [CLASS_FB1, CLASS_FB2, CLASS_FB3]
+
+# Handy mapping for API/UI layers using dropdown keys
+KEY_TO_CLASS: Dict[str, str] = {
+    "FB1": CLASS_FB1,
+    "FB2": CLASS_FB2,
+    "FB3": CLASS_FB3,
+}
+
+# ======= Connection settings (kept from your original) =======
 WEAVIATE_HTTP = os.getenv("WEAVIATE_HTTP", "http://localhost:8080").strip()
 WEAVIATE_PORT_ENV = (os.getenv("WEAVIATE_PORT", "") or "").strip()
 WEAVIATE_GRPC = os.getenv("WEAVIATE_GRPC", "localhost:50051").strip()
 WEAVIATE_GRPC_PORT_ENV = (os.getenv("WEAVIATE_GRPC_PORT", "") or "").strip()
 
-def _parse_host_port(http_env: str, port_env: str, default_port: int) -> tuple[str, int]:
+def _parse_host_port(http_env: str, port_env: str, default_port: int) -> Tuple[str, int]:
     if "://" not in http_env:
         http_env = f"http://{http_env}"
     parsed = urlparse(http_env)
@@ -33,7 +51,7 @@ def _parse_host_port(http_env: str, port_env: str, default_port: int) -> tuple[s
         port = parsed.port or default_port
     return host, int(port)
 
-def _parse_grpc(grpc_env: str, port_env: str, default_port: int) -> tuple[str, int]:
+def _parse_grpc(grpc_env: str, port_env: str, default_port: int) -> Tuple[str, int]:
     host = grpc_env
     port = None
     if ":" in grpc_env:
@@ -57,6 +75,7 @@ def _parse_grpc(grpc_env: str, port_env: str, default_port: int) -> tuple[str, i
 HTTP_HOST, HTTP_PORT = _parse_host_port(WEAVIATE_HTTP, WEAVIATE_PORT_ENV, default_port=8080)
 GRPC_HOST, GRPC_PORT = _parse_grpc(WEAVIATE_GRPC, WEAVIATE_GRPC_PORT_ENV, default_port=50051)
 
+# Connect (same method you used previously)
 client = weaviate.connect_to_local(
     host=HTTP_HOST,
     port=HTTP_PORT,
@@ -64,15 +83,16 @@ client = weaviate.connect_to_local(
     skip_init_checks=True,
 )
 
-def _list_collection_names():
+def _list_collection_names() -> List[str]:
     cols = client.collections.list_all()
     try:
         return [c.name for c in cols]
     except Exception:
+        # Older weaviate clients might already return List[str]
         return list(cols)
 
 def _vector_index_config():
-    
+    """Robust HNSW/COSINE configuration across weaviate versions (kept)."""
     try:
         return Configure.VectorIndex.hnsw(distance=VectorDistances.COSINE)
     except TypeError:
@@ -81,25 +101,65 @@ def _vector_index_config():
         except TypeError:
             return Configure.VectorIndex.hnsw()  # fall back to defaults
 
-def init_schema() -> None:
+def _vectorizer_config():
+    """
+    Default: manual vectors (none) to remain compatible with your existing embedder.
+    If you want Weaviate to embed automatically (OpenAI), replace with:
+        return Configure.Vectorizer.text2vec_openai()
+    and remove manual vector pushes in your loader/embedder.
+    """
+    return Configure.Vectorizer.none()
+
+def _create_collection_if_missing(name: str) -> None:
     existing = _list_collection_names()
-    if CLASS_NAME in existing:
+    if name in existing:
         return
     client.collections.create(
-        name=CLASS_NAME,
+        name=name,
         properties=[
             Property(name="text", data_type=DataType.TEXT),
             Property(name="source", data_type=DataType.TEXT),
             Property(name="page", data_type=DataType.INT),
         ],
-        vectorizer_config=Configure.Vectorizer.none(),  # push vectors manually
-        vector_index_config=_vector_index_config(),
-        description="RAG chunks from uploaded PDFs with manual vectors",
+        vectorizer_config=_vectorizer_config(),      # manual vectors by default
+        vector_index_config=_vector_index_config(),  # HNSW / COSINE
+        description=f"RAG chunks for {name}",
     )
-    print(f"✅ Created schema for '{CLASS_NAME}'")
+    print(f"✅ Created schema for '{name}'")
+
+def ensure_collections() -> None:
+    """Ensure all three isolated collections (FB1/FB2/FB3) exist."""
+    for name in CLASS_NAMES:
+        _create_collection_if_missing(name)
+
+def get_collection(name: str):
+    """Return a collection by exact class name (ensuring it exists)."""
+    ensure_collections()
+    return client.collections.get(name)
+
+def class_from_key(key: str) -> str:
+    """Return class name for 'FB1' | 'FB2' | 'FB3'."""
+    key = key.upper().strip()
+    if key not in KEY_TO_CLASS:
+        raise ValueError(f"Unknown key '{key}'. Expected one of {list(KEY_TO_CLASS.keys())}.")
+    return KEY_TO_CLASS[key]
+
+def get_collection_by_key(key: str):
+    """Return a collection using the dropdown key ('FB1' | 'FB2' | 'FB3')."""
+    return get_collection(class_from_key(key))
 
 def close_client():
     try:
         client.close()
     except Exception:
         pass
+
+# ======= Backward-compat shims =======
+# Some legacy modules import `init_schema` and/or `CLASS_NAME`.
+# We alias init_schema -> ensure_collections, and expose a harmless CLASS_NAME.
+def init_schema() -> None:
+    """Legacy alias — old code calls this; new code uses ensure_collections()."""
+    ensure_collections()
+
+# Legacy default; not used by multi-bot path but keeps old imports happy.
+CLASS_NAME = os.getenv("WEAVIATE_CLASS", "LectureChunk")

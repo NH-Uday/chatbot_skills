@@ -32,7 +32,7 @@ export default function Home() {
             <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
           </div>
         ))}
-        {loading && <p className="text-gray-400 text-sm">ChatGPT is thinking...</p>}
+        {loading && <p className="text-gray-400 text-sm">I am thinking...</p>}
       </div>
 
       <div className="p-4 border-t border-gray-700 bg-gray-800 flex">

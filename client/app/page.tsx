@@ -1,117 +1,160 @@
 'use client'
 
-import { useState, useEffect } from "react";
-import axios from "axios";
+import { useEffect, useState } from 'react'
+import axios from 'axios'
 
 // 🔒 Extend window to support MathJax types
 declare global {
   interface Window {
-    MathJax?: {
-      typeset: () => void;
-    };
+    MathJax?: { typeset: () => void }
   }
 }
 
 type Message = {
-  role: "user" | "assistant";
-  content: string;
-};
+  role: 'user' | 'assistant'
+  content: string
+}
+
+type BotKey = 'FB1' | 'FB2' | 'FB3'
 
 export default function ChatPage() {
-  const [input, setInput] = useState<string>("");
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
+  // --- All hooks must be declared in the same order on every render ---
+  const [mounted, setMounted] = useState(false)
 
-  // ✅ Re-render MathJax equations when messages change
+  // Chat/UI state
+  const [input, setInput] = useState<string>('')
+  const [messages, setMessages] = useState<Message[]>([])
+  const [loading, setLoading] = useState<boolean>(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Bot selector
+  const [bot, setBot] = useState<BotKey>('FB1')
+
+  // API base (configurable via .env.local -> NEXT_PUBLIC_API_BASE)
+  const apiBaseFromEnv =
+    typeof process !== 'undefined'
+      ? (process as any).env?.NEXT_PUBLIC_API_BASE
+      : undefined
+  const apiBase = (apiBaseFromEnv || 'http://localhost:8000').replace(/\/$/, '')
+
+  // Mount gate toggled after first client render
+  useEffect(() => setMounted(true), [])
+
+  // Load MathJax once on client
   useEffect(() => {
-    if (window.MathJax && typeof window.MathJax.typeset === "function") {
-      window.MathJax.typeset();
+    if (!window.MathJax) {
+      const s = document.createElement('script')
+      s.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'
+      s.async = true
+      document.head.appendChild(s)
     }
-  }, [messages]);
+  }, [])
 
-  const sendMessage = async () => {
-    if (!input.trim()) return;
+  // Re-typeset after messages change
+  useEffect(() => {
+    window.MathJax?.typeset?.()
+  }, [messages])
 
-    const userMessage: Message = { role: "user", content: input };
-    const newMessages = [...messages, userMessage];
-    setMessages(newMessages);
-    setInput("");
-    setLoading(true);
+  if (!mounted) return null
+
+  const ask = async () => {
+    const question = input.trim()
+    if (!question || loading) return
+
+    setError(null)
+    setLoading(true)
+
+    const userMsg: Message = { role: 'user', content: question }
+    setMessages(prev => [...prev, userMsg])
+    setInput('')
 
     try {
-      const response = await axios.post("http://localhost:8000/chat", {
-        question: input,
-      });
-
-      const reply: Message = {
-        role: "assistant",
-        content: response.data.answer,
-      };
-
-      setMessages([...newMessages, reply]);
-    } catch (error) {
-      console.error("Error sending message:", error);
+      // Use generic endpoint with target selector
+      const url = `${apiBase}/chat`
+      const res = await axios.post(url, { question, target: bot })
+      const answer: string = res?.data?.answer ?? ''
+      const assistantMsg: Message = {
+        role: 'assistant',
+        content: answer || '(no answer returned)',
+      }
+      setMessages(prev => [...prev, assistantMsg])
+    } catch (e: any) {
+      console.error(e)
+      setError(e?.message || 'Request failed')
+      setMessages(prev => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry — I ran into a problem fetching the answer.' },
+      ])
     } finally {
-      setLoading(false);
+      setLoading(false)
     }
-  };
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') ask()
+  }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-white to-blue-50 p-4">
-      <div className="max-w-3xl mx-auto">
-        <h1 className="text-3xl font-bold text-center text-blue-800 mb-6">
-          Chatbot companion for Lab
-        </h1>
+    <div className="min-h-screen bg-gradient-to-b from-blue-50 to-white">
+      <div className="max-w-3xl mx-auto px-4 py-10">
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-semibold text-gray-800">Chatbot Assistant</h1>
 
-        <div className="space-y-6">
-          {messages.map((msg, index) => (
-            <div
-              key={index}
-              className={`p-4 rounded-xl shadow-md ${
-                msg.role === "user"
-                  ? "bg-white text-right"
-                  : "bg-blue-100 text-left"
-              }`}
+          {/* Bot selector */}
+          <div className="ml-auto flex items-center gap-2">
+            <label htmlFor="bot" className="text-sm text-gray-600">model:</label>
+            <select
+              id="bot"
+              value={bot}
+              onChange={(e) => setBot(e.target.value as BotKey)}
+              className="px-3 py-2 border rounded-lg bg-white text-sm"
+              disabled={loading}
+              aria-label="Select document bot"
             >
-              {msg.role === "assistant" ? (
-                <div className="space-y-3">
-                  {msg.content
-                    .split(/\n(?=🧠|⚖️|🚀)/)
-                    .map((section: string, idx: number) => (
-                      <div key={idx} className="bg-white p-3 rounded-lg">
-                        {/* ✅ Renders LaTeX as HTML */}
-                        <p
-                          className="text-sm whitespace-pre-wrap"
-                          dangerouslySetInnerHTML={{ __html: section.trim() }}
-                        />
-                      </div>
-                    ))}
-                </div>
-              ) : (
-                <p className="text-blue-800 font-semibold">{msg.content}</p>
-              )}
-            </div>
-          ))}
+              <option value="FB1">FB1</option>
+              <option value="FB2">FB2</option>
+              <option value="FB3">FB3</option>
+            </select>
+          </div>
         </div>
 
-        <div className="mt-6 flex items-center gap-2">
+        <div className="mt-6 flex items-center gap-3">
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-            placeholder="Ask a question..."
-            className="flex-1 p-3 border border-blue-300 rounded-xl shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+            onKeyDown={onKeyDown}
+            placeholder={`Ask a question to ${bot}…`}
+            className="flex-1 p-3 border border-blue-300 rounded-xl shadow-sm bg-white text-[15px] leading-6 focus:outline-none focus:ring-2 focus:ring-blue-400"
           />
           <button
-            onClick={sendMessage}
-            disabled={loading}
-            className="px-4 py-2 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition"
+            onClick={ask}
+            disabled={loading || !input.trim()}
+            className="px-4 py-2 rounded-xl bg-blue-600 text-white disabled:opacity-50"
           >
-            {loading ? "..." : "Send"}
+            {loading ? 'I am Thinking…' : 'Ask'}
           </button>
+        </div>
+
+        {error && <div className="mt-3 text-sm text-red-600">{error}</div>}
+
+        <div className="mt-8 space-y-6">
+          {messages.map((m, idx) => (
+            <div
+              key={idx}
+              className={`p-4 rounded-xl shadow-sm ${
+                m.role === 'user' ? 'bg-white border border-gray-200' : 'bg-blue-50 border border-blue-100'
+              }`}
+            >
+              <div className="text-xs uppercase tracking-wide mb-2 text-gray-500">
+                {m.role === 'user' ? 'You' : `Assistant (${bot})`}
+              </div>
+              {/* Render as plain text; MathJax still parses TeX from text nodes */}
+              <p className="text-sm whitespace-pre-wrap">{m.content?.trim?.() ?? ''}</p>
+            </div>
+          ))}
         </div>
       </div>
     </div>
-  );
+  )
 }
