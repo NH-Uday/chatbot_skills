@@ -1,5 +1,6 @@
 import os
 import math
+import re
 from typing import Optional
 import pdfplumber
 from typing import List, Dict, Iterable
@@ -22,6 +23,64 @@ CHUNK_TOKENS = int(os.getenv("CHUNK_TOKENS", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "80"))
 
 oa = OpenAI()
+
+# ---------------------------
+# NEW: Room & Machine helpers
+# ---------------------------
+
+# Matches lines like: "06:55 Uhr – CNC-Fräserei"
+ROOM_HDR = re.compile(r"^\s*\d{2}:\d{2}\s*Uhr\s*[–-]\s*(.+)$")
+
+# Extend/adjust these keyword->label rules to your data as needed
+MACHINE_RULES: List[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bBearbeitungszentrum|\bCNC\b|\bFräs", re.I), "CNC-Bearbeitungszentrum"),
+    (re.compile(r"\bSchleif|Handschleif", re.I), "Schleifen/Handschleifer"),
+    (re.compile(r"\bSchrumpfger", re.I), "Schrumpfgerät"),
+    (re.compile(r"\bPrüfstand", re.I), "Prüfstand"),
+    (re.compile(r"\bLOTO|Schaltschrank|400\s*V|63\s*A", re.I), "Schaltschrank/LOTO"),
+    (re.compile(r"\bAbsaug|KSS|Aerosol|Nebel|Nassschleif", re.I), "Absaugung/KSS"),
+]
+
+def _detect_room_from_page_text(text: str, fallback: Optional[str] = None) -> str:
+    """
+    Try to detect the room title from a page's text via header pattern.
+    Falls back to the last known room or 'Unklar' if nothing found.
+    """
+    for line in text.splitlines():
+        m = ROOM_HDR.match(line.strip())
+        if m:
+            return m.group(1).strip()
+    return fallback or "Unklar"
+
+def _detect_machine_from_chunk(snippet: str) -> str:
+    """
+    Heuristic machine classification from the chunk text.
+    Returns a stable label or 'Allgemein' if nothing matched.
+    """
+    for rx, label in MACHINE_RULES:
+        if rx.search(snippet):
+            return label
+    return "Allgemein"
+
+def _read_pdf_with_rooms(path: str) -> List[Dict]:
+    """
+    NEW: Read PDF pages and carry forward the most recent detected room.
+    Keeps page ordering intact so rooms propagate across multi-page sections.
+    """
+    out: List[Dict] = []
+    with pdfplumber.open(path) as pdf:
+        current_room: Optional[str] = None
+        for i, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            if not text.strip():
+                continue
+            current_room = _detect_room_from_page_text(text, fallback=current_room)
+            out.append({"page": i, "text": text, "room": current_room})
+    return out
+
+# ---------------------------
+# (Existing) helpers — unchanged
+# ---------------------------
 
 def _read_pdf(path: str) -> List[Dict]:
     out = []
@@ -65,6 +124,10 @@ def _target_class_from_env_or_key(target: Optional[str]) -> str:
         return t
     return os.getenv("WEAVIATE_CLASS", "LectureChunk")
 
+# ---------------------------
+# Ingestion — minimally updated to include room & machine
+# ---------------------------
+
 def embed_and_store(pdf_path: str, target: Optional[str] = None):
     """
     Ingest a PDF into the chosen Weaviate collection.
@@ -79,15 +142,23 @@ def embed_and_store(pdf_path: str, target: Optional[str] = None):
     coll = get_collection(class_name)
     print(f"[embedder] Inserting into: {class_name}")
 
-    # --- Read & chunk ---
-    docs = _read_pdf(pdf_path)
+    # --- Read & chunk (room-aware) ---
+    # NOTE: We keep _read_pdf for compatibility, but use the new room-aware reader here.
+    docs = _read_pdf_with_rooms(pdf_path)
     basename = os.path.basename(pdf_path)
 
-    raw_chunks = []
+    raw_chunks: List[Dict] = []
     for d in docs:
-        for ch in _chunk_text(d["text"], model="gpt-4o-mini"):  
-            pretty = format_equations_for_mathjax(ch)           
-            raw_chunks.append({"text": pretty, "source": basename, "page": d["page"]})
+        for ch in _chunk_text(d["text"], model="gpt-4o-mini"):
+            pretty = format_equations_for_mathjax(ch)
+            machine = _detect_machine_from_chunk(pretty)
+            raw_chunks.append({
+                "text": pretty,
+                "source": basename,
+                "page": d["page"],
+                "room": d.get("room") or "Unklar",
+                "machine": machine,
+            })
 
     if not raw_chunks:
         print(f"⚠️ No text in {basename}")
@@ -97,25 +168,29 @@ def embed_and_store(pdf_path: str, target: Optional[str] = None):
     batch_size = 64
     for i in range(0, len(raw_chunks), batch_size):
         batch = raw_chunks[i : i + batch_size]
-        vectors = _embed_texts([b["text"] for b in batch])     
+        vectors = _embed_texts([b["text"] for b in batch])
 
         with coll.batch.dynamic() as b:
             for item, vec in zip(batch, vectors):
                 b.add_object(
-                    properties=item,
+                    properties=item,   # includes text/source/page/room/machine
                     vector=vec,
                 )
 
     print(f"✅ Indexed {len(raw_chunks)} chunks from {basename}")
 
 def load_all_pdfs():
+
     if not os.path.exists(PDF_DIR):
         print(f"❌ Folder not found: {PDF_DIR}")
         return
-    init_schema()
+
+    # Ensure collections exist (this replaces old 'init_schema' call)
+    ensure_collections()
+
     for f in os.listdir(PDF_DIR):
         if f.lower().endswith(".pdf"):
             embed_and_store(os.path.join(PDF_DIR, f))
 
-    client.close()  
+    client.close()
 

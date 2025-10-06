@@ -92,7 +92,7 @@ def _list_collection_names() -> List[str]:
         return list(cols)
 
 def _vector_index_config():
-    """Robust HNSW/COSINE configuration across weaviate versions (kept)."""
+    
     try:
         return Configure.VectorIndex.hnsw(distance=VectorDistances.COSINE)
     except TypeError:
@@ -102,12 +102,7 @@ def _vector_index_config():
             return Configure.VectorIndex.hnsw()  # fall back to defaults
 
 def _vectorizer_config():
-    """
-    Default: manual vectors (none) to remain compatible with your existing embedder.
-    If you want Weaviate to embed automatically (OpenAI), replace with:
-        return Configure.Vectorizer.text2vec_openai()
-    and remove manual vector pushes in your loader/embedder.
-    """
+    
     return Configure.Vectorizer.none()
 
 def _create_collection_if_missing(name: str) -> None:
@@ -120,9 +115,11 @@ def _create_collection_if_missing(name: str) -> None:
             Property(name="text", data_type=DataType.TEXT),
             Property(name="source", data_type=DataType.TEXT),
             Property(name="page", data_type=DataType.INT),
+            Property(name="room", data_type=DataType.TEXT),    
+            Property(name="machine", data_type=DataType.TEXT),  
         ],
-        vectorizer_config=_vectorizer_config(),      # manual vectors by default
-        vector_index_config=_vector_index_config(),  # HNSW / COSINE
+        vectorizer_config=_vectorizer_config(),      
+        vector_index_config=_vector_index_config(),  
         description=f"RAG chunks for {name}",
     )
     print(f"✅ Created schema for '{name}'")

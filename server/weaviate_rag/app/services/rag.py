@@ -4,6 +4,7 @@ from typing import List, Dict, Tuple, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 from weaviate.classes.query import MetadataQuery
+from typing import List, Dict, Any, Optional
 
 # New multi-bot helpers (backward-compatible)
 from app.services.weaviate_setup import (
@@ -25,11 +26,13 @@ CANDIDATES_PER_QUERY = int(os.getenv("CANDIDATES_PER_QUERY", "12"))  # per expan
 EXPANSIONS = int(os.getenv("EXPANSIONS", "4"))  # number of LLM paraphrases
 KEEP_FOR_CONTEXT = int(os.getenv("KEEP_FOR_CONTEXT", "8"))  # final chunks for answer
 
-
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")
 TOP_K = int(os.getenv("TOP_K", "6"))
 HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.5"))
+
+# IMPORTANT: include room & machine so we can detect ambiguity
+RETURN_PROPS = ["text", "source", "page", "room", "machine"]
 
 oa = OpenAI()
 
@@ -50,11 +53,12 @@ def _embed(q: str) -> List[float]:
     return oa.embeddings.create(model=OPENAI_EMBED_MODEL, input=q).data[0].embedding
 
 def _vector_search(coll, query_vec, k=TOP_K):
+    # return room & machine in hits
     return coll.query.near_vector(
         near_vector=query_vec,
         limit=k,
         return_metadata=MetadataQuery(distance=True),
-        return_properties=["text", "source", "page"],  
+        return_properties=RETURN_PROPS,
     )
 
 def _bm25_search(coll, query: str, k=TOP_K):
@@ -63,7 +67,7 @@ def _bm25_search(coll, query: str, k=TOP_K):
             query=query,
             limit=k,
             return_metadata=MetadataQuery(rank=True),
-            return_properties=["text", "source", "page"], 
+            return_properties=RETURN_PROPS,
         )
     except Exception:
         return None
@@ -111,7 +115,14 @@ def _format_context(objs) -> Tuple[str, List[Dict]]:
     chunks = []
     for o in objs:
         props = o.properties
-        chunks.append({"text": props["text"], "source": props["source"], "page": props["page"]})
+        chunks.append({
+            "text": props["text"],
+            "source": props["source"],
+            "page": props["page"],
+            # (optional) you could also carry room/machine here if you want
+            # "room": props.get("room"),
+            # "machine": props.get("machine"),
+        })
     context = "\n\n---\n\n".join(
         f"[{i+1}] (Quelle: {c['source']}, Seite {c['page']})\n{c['text']}"
         for i, c in enumerate(chunks)
@@ -266,7 +277,6 @@ def _cleanup_z_between(answer: str) -> str:
     return out
 
 def _multiquery_expand(question: str, n: int = EXPANSIONS) -> list[str]:
-    
     prompt = (
         "Generate {n} short alternative German phrasings for the following question. "
         "Keep domain terms; vary synonyms and morphology. One per line, no numbering.\n\n"
@@ -306,7 +316,6 @@ def _soft_unit_score(q_hints: set[str], text: str) -> float:
     return score
 
 def _mmr_select(question_vec: list[float], objs: list, k: int = KEEP_FOR_CONTEXT, lambda_: float = 0.7):
-    
     selected = []
     candidates = objs[:]
     sims = {}
@@ -417,6 +426,104 @@ def _numeric_guard(answer: str, sources_text: str) -> str:
     cleaned = _cleanup_z_between(ans_norm)
     return cleaned
 
+# (Left as-is; not used by the main pipeline. Keep for compatibility.)
+def vector_search(q):  
+    return client.query(..., return_properties=RETURN_PROPS, limit=K)
+
+ROOM_KEYWORDS = {
+    # CNC
+    "cnc": "CNC-Fräserei", "fräs": "CNC-Fräserei", "fraes": "CNC-Fräserei",
+    "machining": "CNC-Fräserei", "milling": "CNC-Fräserei",
+
+    # Werkzeug- & Schleifraum
+    "schleif": "Werkzeug- & Schleifraum", "werkzeug": "Werkzeug- & Schleifraum",
+    "grind": "Werkzeug- & Schleifraum", "grinding": "Werkzeug- & Schleifraum",
+
+    # Endmontage & Prüfstand
+    "montage": "Endmontage & Prüfstand", "prüf": "Endmontage & Prüfstand",
+    "pruef": "Endmontage & Prüfstand", "test bench": "Endmontage & Prüfstand",
+    "endmontage": "Endmontage & Prüfstand", "prüfstand": "Endmontage & Prüfstand",
+}
+
+MACHINE_KEYWORDS = {
+    "cnc": "CNC-Bearbeitungszentrum",
+    "bearbeitungszentrum": "CNC-Bearbeitungszentrum",
+    "schleif": "Schleifen/Handschleifer",
+    "handschleif": "Schleifen/Handschleifer",
+    "prüfstand": "Prüfstand",
+    "schrumpf": "Schrumpfgerät",
+    "loto": "Schaltschrank/LOTO",
+}
+
+# Known rooms (case-insensitive match)
+KNOWN_ROOMS = {
+    "CNC-Fräserei",
+    "Werkzeug- & Schleifraum",
+    "Endmontage & Prüfstand",
+}
+
+# --- Noise disambiguation helpers ---
+
+# What the user might explicitly ask for
+NOISE_KEYWORDS = {
+    "laeq": ["laeq", "leq", "durchschnitt", "average"],
+    "peak": ["peak", "lafmax", "spitze", "spitzenwert", "maximal"],
+    "limit": ["grenzwert", "expositionsgrenzwert", "am ohr", "ohr"],
+    "room": ["raum", "raumpegel", "im raum", "hintergrundpegel"],
+}
+
+def _detect_noise_kind_from_question(q: str) -> Optional[str]:
+    ql = q.lower()
+    for kind, kws in NOISE_KEYWORDS.items():
+        if any(k in ql for k in kws):
+            return kind
+    return None
+
+# How to detect kinds from retrieved text
+NOISE_PATTERNS = {
+    "laeq": re.compile(r"\bLAeq\b|\bLeq\b", re.I),
+    "peak": re.compile(r"\bPeak[s]?\b|\bLAFmax\b|\bMax(?:imal)?\b", re.I),
+    "limit": re.compile(r"\bExpositionsgrenzwert\b|\bGrenzwert\b|am\s*Ohr", re.I),
+    "room": re.compile(r"\bim\s*Raum\b|\bRaumpegel\b|\bHintergrundpegel\b", re.I),
+}
+
+def _classify_noise_kinds_in_objs(objs) -> set[str]:
+    kinds = set()
+    for o in objs:
+        t = o.properties.get("text", "")
+        for kind, rx in NOISE_PATTERNS.items():
+            if rx.search(t):
+                kinds.add(kind)
+    return kinds
+
+def _filter_objs_by_noise_kind(objs, kind: str):
+    rx = NOISE_PATTERNS.get(kind)
+    if not rx:
+        return objs
+    filtered = [o for o in objs if rx.search(o.properties.get("text", ""))]
+    return filtered or objs  # fallback if over-filtered
+
+def detect_room_from_question(q: str):
+    ql = q.lower()
+    for k, v in ROOM_KEYWORDS.items():
+        if k in ql:
+            return v
+    return None
+
+def _looks_like_room_only(q: str) -> Optional[str]:
+    s = (q or "").strip()
+    for r in KNOWN_ROOMS:
+        if s.lower() == r.lower():
+            return r
+    return None
+
+def pick_machine_from_question(q):
+    ql = q.lower()
+    for k, v in MACHINE_KEYWORDS.items():
+        if k in ql:
+            return v
+    return None
+
 # ---------------------------
 # Main retrieval pipeline
 # ---------------------------
@@ -438,17 +545,117 @@ def _resolve_collection(target: Optional[str]):
 def retrieve_answer(question: str, target: Optional[str] = None) -> str:
     coll = _resolve_collection(target)
 
+    # --- normalization helper (local & minimal) ---
+    def _norm_local(s: Optional[str]) -> str:
+        if not s:
+            return ""
+        return re.sub(r"\s+", " ", s).replace("–", "-").strip().lower()
+
+    # Detect if user already specified room/machine
+    asked_room = detect_room_from_question(question)
+    asked_machine = pick_machine_from_question(question)
+
+    # --- Option A: user replied with only a room name
+    room_only = _looks_like_room_only(question)
+    if room_only:
+        return (
+            f"Verstanden: **{room_only}**.\n"
+            "Bitte gib auch die Kennzahl an, z. B.:\n"
+            f"- *Wie hoch ist der Geräuschpegel in {room_only}?*\n"
+            f"- *Temperatur in {room_only}?*\n"
+            f"- *Vibrationen in {room_only}?*\n"
+        )
+
+    # ---------- Noise-kind helpers (local to keep the patch minimal) ----------
+    is_noise_q = bool(re.search(r"\b(noise|geräusch|lärm)\b", question, re.I))
+
+    NOISE_PATTERNS = {
+        "laeq": re.compile(r"\bLAeq\b|\bLeq\b", re.I),
+        "peak": re.compile(r"\bPeak[s]?\b|\bLAFmax\b|\bMax(?:imal)?\b", re.I),
+        "limit": re.compile(r"\bExpositionsgrenzwert\b|\bGrenzwert\b|am\s*Ohr", re.I),
+        "room": re.compile(r"\bim\s*Raum\b|\bRaumpegel\b|\bHintergrundpegel\b", re.I),
+    }
+    def _detect_noise_kind_from_question_local(q: str) -> Optional[str]:
+        ql = q.lower()
+        if any(k in ql for k in ["laeq", "leq", "durchschnitt", "average"]): return "laeq"
+        if any(k in ql for k in ["peak", "lafmax", "spitze", "spitzenwert", "maximal"]): return "peak"
+        if any(k in ql for k in ["grenzwert", "expositionsgrenzwert", "am ohr", "ohr"]): return "limit"
+        if any(k in ql for k in ["raum", "raumpegel", "im raum", "hintergrundpegel"]): return "room"
+        return None
+
+    def _classify_noise_kinds_in_objs_local(_objs) -> set[str]:
+        kinds = set()
+        for o in _objs:
+            t = o.properties.get("text", "")
+            for kind, rx in NOISE_PATTERNS.items():
+                if rx.search(t):
+                    kinds.add(kind)
+        return kinds
+
+    def _filter_objs_by_noise_kind_local(_objs, kind: str):
+        rx = NOISE_PATTERNS.get(kind)
+        if not rx:
+            return _objs
+        _filtered = [o for o in _objs if rx.search(o.properties.get("text", ""))]
+        return _filtered or _objs  # fallback if over-filtered
+
+    noise_kind_asked = _detect_noise_kind_from_question_local(question)
+
     # 1) Multi-query expansion
     queries = _multiquery_expand(question, n=EXPANSIONS)
+
+    # 1a) Bias queries only if the user specified room/machine/noise-kind
+    def _prefix(q: str) -> str:
+        pref = ""
+        if asked_room:    pref += f"{asked_room}: "
+        if asked_machine: pref += f"{asked_machine}: "
+        nk = _detect_noise_kind_from_question_local(q)
+        if nk == "laeq":    pref += "LAeq: "
+        elif nk == "peak":  pref += "Peak LAFmax: "
+        elif nk == "limit": pref += "Expositionsgrenzwert am Ohr: "
+        elif nk == "room":  pref += "Raumpegel: "
+        # optional: default bias for generic "noise level" phrasing
+        if is_noise_q and re.search(r"\blevel\b|\bniveau\b", q, re.I) and "LAeq" not in pref:
+            pref += "LAeq: "
+        return pref + q if pref else q
+
+    queries = [_prefix(q) for q in queries]
 
     # 2) Gather & dedup candidates
     objs_all = _gather_candidates(coll, queries)
 
+    # Pre-filter by room before ranking (if user specified a room)
+    if asked_room:
+        objs_room = [o for o in objs_all if _norm_local(o.properties.get("room")) == _norm_local(asked_room)]
+        if objs_room:
+            objs_all = objs_room
+
+    # If user already specified a noise kind, pre-filter candidates to that kind
+    if is_noise_q and noise_kind_asked and objs_all:
+        objs_kind = _filter_objs_by_noise_kind_local(objs_all, noise_kind_asked)
+        if objs_kind:
+            objs_all = objs_kind
+
+    # ---- Early noise-kind ambiguity check BEFORE ranking ----
+    if is_noise_q and objs_all:
+        room_noise_kinds = _classify_noise_kinds_in_objs_local(objs_all)
+        if not noise_kind_asked and len(room_noise_kinds) > 1:
+            label_map = {
+                "laeq": "LAeq (Durchschnitt)",
+                "peak": "Peak / LAFmax",
+                "limit": "Grenzwert am Ohr",
+                "room": "Raumpegel (im Raum)",
+            }
+            # UPDATED: echo full question in each option
+            opts = [k for k in ["laeq", "peak", "limit", "room"] if k in room_noise_kinds]
+            options_list = [f"- {question} — Kennzahl: {label_map[k]}" for k in opts]
+            return "Welche Kennzahl meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
+
     if not objs_all:
         # Fallback to classic single-query retrieval
-        qvec = _embed(question)
+        qvec = _embed(question if not asked_room and not asked_machine else _prefix(question))
         vec_res = _vector_search(coll, qvec, k=KEEP_FOR_CONTEXT)
-        bm25_res = _bm25_search(coll, question, k=KEEP_FOR_CONTEXT)
+        bm25_res = _bm25_search(coll, question if not asked_room and not asked_machine else _prefix(question), k=KEEP_FOR_CONTEXT)
         objs = _hybrid_rank(vec_res, bm25_res, alpha=HYBRID_ALPHA)
     else:
         # 3) Unit-aware soft boost to bring measurements forward
@@ -458,8 +665,15 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             base = 0.0
             if hasattr(o, "metadata") and getattr(o.metadata, "distance", None) is not None:
                 base = 1.0 - float(o.metadata.distance)
-            boost = _soft_unit_score(hints, o.properties.get("text", ""))
-            scored.append((base + 0.15 * boost, o))  # small boost weight
+            txt = o.properties.get("text", "")
+            boost = _soft_unit_score(hints, txt)
+
+            # tiny preference for explicit noise markers on noise questions
+            noise_marker = 0.0
+            if is_noise_q and re.search(r"\bLAeq\b|\bLeq\b|\bLAFmax\b|\bdB\(A\)|\bdB\b", txt, re.I):
+                noise_marker = 0.2
+
+            scored.append((base + 0.15 * boost + noise_marker, o))
 
         # Sort by boosted score and apply MMR for diversity
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -469,6 +683,95 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
         # 4) LLM rerank top K (final cut)
         objs = _rerank_llm(question, objs_mmr, top_n=KEEP_FOR_CONTEXT)
 
+    # ---------- Ambiguity checks BEFORE composing the answer ----------
+
+    # Rooms present in top hits
+    rooms_in_top = []
+    for o in objs:
+        r = (o.properties.get("room") or "").strip()
+        if r:
+            rooms_in_top.append(r)
+    unique_rooms = sorted({r for r in rooms_in_top if r and r.lower() not in {"unklar", "gesamt"}})
+
+    # Improved room clarification: suggest full follow-up questions
+    if not asked_room and len(unique_rooms) > 1:
+        options = "\n".join(f"- {question} in {r}" for r in unique_rooms)
+        return (
+            "Welchen Raum meinen Sie?\n"
+            "Antworte mit einer der folgenden Optionen:\n"
+            f"{options}"
+        )
+
+    # If a room is specified (or only one appears), filter to that room to avoid mixing
+    if asked_room:
+        objs = [o for o in objs if _norm_local(o.properties.get("room")) == _norm_local(asked_room)]
+        if not objs:  # safety fallback
+            objs = _rerank_llm(question, objs_all[:KEEP_FOR_CONTEXT*2], top_n=KEEP_FOR_CONTEXT)
+
+    # Machine ambiguity (after room disambiguation)
+    machines_in_top = []
+    for o in objs:
+        m = (o.properties.get("machine") or "").strip()
+        if m:
+            machines_in_top.append(m)
+    real_machines = sorted({m for m in machines_in_top if m and m.lower() != "allgemein"})
+
+    if not asked_machine and len(real_machines) > 1:
+        # UPDATED: echo full question in each option
+        options_list = [f"- {question} — Maschine: {m}" for m in real_machines]
+        return "Welche Maschine meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
+
+    # If machine specified, filter to that machine as well (keeps answer precise)
+    if asked_machine:
+        objs_filtered = [o for o in objs if _norm_local(o.properties.get("machine")) == _norm_local(asked_machine)]
+        if objs_filtered:
+            objs = objs_filtered
+
+    # ---------- Noise-specific disambiguation (inside the room) ----------
+    if is_noise_q:
+        kinds_now = _classify_noise_kinds_in_objs_local(objs)
+        if not noise_kind_asked and len(kinds_now) > 1:
+            label_map = {
+                "laeq": "LAeq (Durchschnitt)",
+                "peak": "Peak / LAFmax",
+                "limit": "Grenzwert am Ohr",
+                "room": "Raumpegel (im Raum)",
+            }
+            # UPDATED: echo full question in each option
+            ordered = [k for k in ["laeq", "peak", "limit", "room"] if k in kinds_now]
+            options_list = [f"- {question} — Kennzahl: {label_map[k]}" for k in ordered]
+            return "Welche Kennzahl meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
+
+        # Auto-select the single remaining kind
+        if not noise_kind_asked and len(kinds_now) == 1:
+            noise_kind_asked = next(iter(kinds_now))
+
+        # If user specified a kind, filter and apply robust fallback
+        if noise_kind_asked:
+            filtered = _filter_objs_by_noise_kind_local(objs, noise_kind_asked)
+            if not filtered:
+                core_rx = re.compile(r"\b(?:LAeq|Leq|LAFmax|dB\(A\)|dB)\b", re.I)
+                filtered = [o for o in objs if core_rx.search(o.properties.get("text", ""))]
+            if not filtered:
+                room_only_pool = [o for o in objs_all if _norm_local(o.properties.get("room")) == _norm_local(asked_room)] if asked_room else objs_all[:]
+                if noise_kind_asked in NOISE_PATTERNS:
+                    rx = NOISE_PATTERNS[noise_kind_asked]
+                    filtered = [o for o in room_only_pool if rx.search(o.properties.get("text", ""))]
+                if not filtered:
+                    core_rx = re.compile(r"\b(?:LAeq|Leq|LAFmax|dB\(A\)|dB)\b", re.I)
+                    filtered = [o for o in room_only_pool if core_rx.search(o.properties.get("text", ""))]
+            if filtered:
+                objs = filtered
+
+        # Gentle preference for measurement-bearing text
+        dba_rx = re.compile(r"\b(?:dB\(A\)|dB|LAeq|LAFmax|Lärm|Geräusch)\b", re.I)
+        objs_dba = [o for o in objs if dba_rx.search(o.properties.get("text", ""))]
+        if objs_dba:
+            objs = objs_dba
+
+    # -----------------------------------------------------------------
+
+    # Compose context & ask the model
     context, chunks = _format_context(objs)
 
     messages = [
@@ -483,7 +786,7 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
     )
     draft = (resp.choices[0].message.content or "").strip()
 
-    # numeric sanity pass (you already had this)
+    # numeric sanity pass
     sources_concat = "\n".join(c["text"] for c in chunks)
     final = _numeric_guard(draft, sources_concat)
 
@@ -492,4 +795,3 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
         final = f"{final}\n\n— Quellen: {cites}"
 
     return final
-
