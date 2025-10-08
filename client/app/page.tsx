@@ -30,6 +30,9 @@ export default function ChatPage() {
   // Bot selector
   const [bot, setBot] = useState<BotKey>('FB1')
 
+  // NEW: session id (regenerated on Refresh)
+  const [sessionId, setSessionId] = useState<string>('') // NEW
+
   // API base (configurable via .env.local -> NEXT_PUBLIC_API_BASE)
   const apiBaseFromEnv =
     typeof process !== 'undefined'
@@ -39,6 +42,17 @@ export default function ChatPage() {
 
   // Mount gate toggled after first client render
   useEffect(() => setMounted(true), [])
+
+  // NEW: create a fresh session id on first mount
+  useEffect(() => {
+    if (!sessionId) {
+      const id =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      setSessionId(id)
+    }
+  }, [sessionId])
 
   // Load MathJax once on client
   useEffect(() => {
@@ -69,9 +83,9 @@ export default function ChatPage() {
     setInput('')
 
     try {
-      // Use generic endpoint with target selector
+      // Use generic endpoint with target selector + session_id (NEW)
       const url = `${apiBase}/chat`
-      const res = await axios.post(url, { question, target: bot })
+      const res = await axios.post(url, { question, target: bot, session_id: sessionId }) // NEW
       const answer: string = res?.data?.answer ?? ''
       const assistantMsg: Message = {
         role: 'assistant',
@@ -92,6 +106,26 @@ export default function ChatPage() {
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') ask()
+  }
+
+  // NEW: Refresh button handler — clears memory on server and starts a new session
+  const refreshSession = async () => {
+    try {
+      await axios.post(`${apiBase}/session/reset`, null, {
+        params: { session_id: sessionId },
+      })
+    } catch (e) {
+      // Even if reset fails, we still rotate the client session to avoid stale context
+      console.warn('Session reset failed; rotating client session anyway.')
+    } finally {
+      const newId =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      setSessionId(newId)
+      setMessages([]) // optional: start with a clean chat view
+      setError(null)
+    }
   }
 
   return (
@@ -115,7 +149,22 @@ export default function ChatPage() {
               <option value="FB2">FB2</option>
               <option value="FB3">FB3</option>
             </select>
+
+            {/* NEW: Refresh (clears server-side session memory) */}
+            <button
+              onClick={refreshSession}
+              disabled={loading}
+              className="ml-2 px-3 py-2 rounded-lg border border-gray-300 bg-white text-sm hover:bg-gray-50 disabled:opacity-50"
+              title="Start a new chat session"
+            >
+              Refresh
+            </button>
           </div>
+        </div>
+
+        {/* NEW: tiny session badge (optional, helps debug) */}
+        <div className="mt-2 text-[11px] text-gray-500 select-all">
+          session: <span className="font-mono">{sessionId || '—'}</span>
         </div>
 
         <div className="mt-6 flex items-center gap-3">

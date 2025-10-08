@@ -42,10 +42,7 @@ MACHINE_RULES: List[tuple[re.Pattern, str]] = [
 ]
 
 def _detect_room_from_page_text(text: str, fallback: Optional[str] = None) -> str:
-    """
-    Try to detect the room title from a page's text via header pattern.
-    Falls back to the last known room or 'Unklar' if nothing found.
-    """
+    
     for line in text.splitlines():
         m = ROOM_HDR.match(line.strip())
         if m:
@@ -53,30 +50,60 @@ def _detect_room_from_page_text(text: str, fallback: Optional[str] = None) -> st
     return fallback or "Unklar"
 
 def _detect_machine_from_chunk(snippet: str) -> str:
-    """
-    Heuristic machine classification from the chunk text.
-    Returns a stable label or 'Allgemein' if nothing matched.
-    """
+    
     for rx, label in MACHINE_RULES:
         if rx.search(snippet):
             return label
     return "Allgemein"
 
+
 def _read_pdf_with_rooms(path: str) -> List[Dict]:
-    """
-    NEW: Read PDF pages and carry forward the most recent detected room.
-    Keeps page ordering intact so rooms propagate across multi-page sections.
-    """
+    
     out: List[Dict] = []
     with pdfplumber.open(path) as pdf:
         current_room: Optional[str] = None
         for i, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            if not text.strip():
+            raw = page.extract_text() or ""
+            if not raw.strip():
                 continue
-            current_room = _detect_room_from_page_text(text, fallback=current_room)
-            out.append({"page": i, "text": text, "room": current_room})
+
+            lines = raw.splitlines()
+            sections: List[Tuple[str, List[str]]] = []  # [(room, lines)]
+            room_here: Optional[str] = None
+            buf: List[str] = []
+
+            def flush_buffer():
+                if buf:
+                    text_block = "\n".join(buf).strip()
+                    if text_block:
+                        sections.append((room_here or current_room or "Unklar", [text_block]))
+
+            for ln in lines:
+                m = ROOM_HDR.match(ln.strip())
+                if m:
+                    # new section header → flush previous buffer
+                    flush_buffer()
+                    # update room for this section
+                    room_here = m.group(1).strip()
+                    # carry forward for subsequent sections across pages
+                    current_room = room_here
+                    buf = []
+                else:
+                    buf.append(ln)
+
+            # leftover lines on the page
+            flush_buffer()
+
+            # Build output records
+            for room_label, blocks in sections:
+                out.append({"page": i, "text": "\n".join(blocks), "room": room_label})
+
+            # If no header found at all, still emit the page with fallback room
+            if not sections:
+                out.append({"page": i, "text": raw, "room": current_room or "Unklar"})
+
     return out
+
 
 # ---------------------------
 # (Existing) helpers — unchanged
@@ -129,11 +156,7 @@ def _target_class_from_env_or_key(target: Optional[str]) -> str:
 # ---------------------------
 
 def embed_and_store(pdf_path: str, target: Optional[str] = None):
-    """
-    Ingest a PDF into the chosen Weaviate collection.
-    `target` can be "FB1" | "FB2" | "FB3" or an exact class name.
-    If omitted, falls back to WEAVIATE_CLASS or 'LectureChunk'.
-    """
+    
     # Make sure all collections exist
     ensure_collections()
 

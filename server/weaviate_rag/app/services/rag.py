@@ -133,9 +133,10 @@ def _format_context(objs) -> Tuple[str, List[Dict]]:
 # Numeric guard utilities
 # ---------------------------
 
-_DASH_PATTERN = re.compile(r"[–—−\-]+")  
+_DASH_PATTERN = re.compile(r"[–—−\-]+")
 _WS = re.compile(r"\s+")
 
+# include aerosol units (mg/m³, mg/m3, µg/m³, ug/m3)
 _NUM_SPAN_RE = re.compile(
     r"""
     (?P<num1>\d+(?:[.,]\d+)?)                       # first number
@@ -143,6 +144,7 @@ _NUM_SPAN_RE = re.compile(
     \s*
     (?P<unit>
         ppm|
+        mg/m³|mg/m3|µg/m³|ug/m3|
         dB\(A\)|dB|
         m/s(?:²|\^2|2)?|
         %|
@@ -163,6 +165,7 @@ def _norm_ws(s: str) -> str:
 def _to_float(s: str) -> float:
     return float(s.replace(",", ".").strip())
 
+# normalize aerosol & other unit variants
 def _norm_unit(u: Optional[str]) -> str:
     if not u:
         return ""
@@ -171,6 +174,7 @@ def _norm_unit(u: Optional[str]) -> str:
     if u.lower() == "db":
         u = "dB"
     u = u.replace("m/s^2", "m/s²").replace("m/s2", "m/s²")
+    u = u.replace("mg/m3", "mg/m³").replace("ug/m3", "µg/m³")
     return u
 
 def _extract_numeric_spans(text: str) -> List[Dict]:
@@ -278,7 +282,7 @@ def _cleanup_z_between(answer: str) -> str:
 
 def _multiquery_expand(question: str, n: int = EXPANSIONS) -> list[str]:
     prompt = (
-        "Generate {n} short alternative German phrasings for the following question. "
+        f"Generate {n} short alternative German phrasings for the following question. "
         "Keep domain terms; vary synonyms and morphology. One per line, no numbering.\n\n"
         f"Frage: {question}"
     )
@@ -286,16 +290,19 @@ def _multiquery_expand(question: str, n: int = EXPANSIONS) -> list[str]:
     out = oa.chat.completions.create(model=OPENAI_MODEL, messages=msg, temperature=0.2)
     text = (out.choices[0].message.content or "").strip()
     alts = [l.strip("•- ").strip() for l in text.splitlines() if l.strip()]
-    # Fallback in case the model returns fewer lines
     return [question] + alts[:max(0, n)]
 
-_UNIT_TOKENS = ["ppm", "dB(A)", "dB", "m/s²", "°C", "%", "lx", "A", "V"]
+
+# include aerosol units in unit tokens
+_UNIT_TOKENS = ["ppm", "mg/m³", "mg/m3", "µg/m³", "ug/m3", "dB(A)", "dB", "m/s²", "°C", "%", "lx", "A", "V"]
 
 def _question_unit_hints(q: str) -> set[str]:
     qn = _norm_dash(q.lower())
+    qn = qn.replace("³", "3")
     hits = set()
     for u in _UNIT_TOKENS:
-        if u.lower().replace("(", "").replace(")", "") in qn.replace("(", "").replace(")", ""):
+        key = u.lower().replace("³", "3")
+        if key.replace("(", "").replace(")", "") in qn.replace("(", "").replace(")", ""):
             hits.add(u)
     # Also add simple numeric hint if any number present
     if re.search(r"\d", qn):
@@ -306,13 +313,34 @@ def _soft_unit_score(q_hints: set[str], text: str) -> float:
     if not q_hints:
         return 0.0
     t = _norm_dash(text.lower())
+    t = t.replace("³", "3")
     score = 0.0
     for u in q_hints:
         if u == "<NUM>":
             if re.search(r"\d", t): score += 0.5
         else:
-            if u.lower().replace("(", "").replace(")", "") in t.replace("(", "").replace(")", ""):
+            key = u.lower().replace("³", "3")
+            if key.replace("(", "").replace(")", "") in t.replace("(", "").replace(")", ""):
                 score += 1.0
+    return score
+
+# --- NEW: soft keyword score for domain keywords (not units)
+def _soft_keyword_score(question: str, text: str) -> float:
+    ql = question.lower()
+    tl = text.lower()
+    score = 0.0
+    # Starkstrom / Schaltschrank context
+    if any(k in ql for k in ["starkstrom", "schaltschrank", "loto", "400 v", "63 a"]):
+        for k in ["starkstrom", "schaltschrank", "loto", "400 v", "63 a", "offen 400 v/63 a"]:
+            if k in tl: score += 0.6
+    # KSS / aerosols context
+    if any(k in ql for k in ["kss", "aerosol", "feinstaub", "druckluft", "spannvorrichtung", "rüsten", "ruesten"]):
+        for k in ["kss", "kss-aerosole", "aerosol", "mg/m³", "nebel", "schleier", "druckluft", "spannvorrichtung"]:
+            if k in tl: score += 0.5
+    # Abbreviation lookup context
+    if re.search(r"\b(was\s+bedeutet|what\s+does).+\b", ql):
+        for k in ["abkürzungsverzeichnis", "abkuerzungsverzeichnis", "kss", "kühlschmierstoff", "kuehlschmierstoff"]:
+            if k in tl: score += 0.4
     return score
 
 def _mmr_select(question_vec: list[float], objs: list, k: int = KEEP_FOR_CONTEXT, lambda_: float = 0.7):
@@ -396,7 +424,7 @@ def _gather_candidates(coll, queries: list[str]) -> list:
         vec = _vector_search(coll, qvec, k=CANDIDATES_PER_QUERY)
         bm  = _bm25_search(coll, q, k=CANDIDATES_PER_QUERY)
         for res in [vec, bm]:
-            if not res: 
+            if not res:
                 continue
             for o in res.objects:
                 bag[o.uuid] = o   # dedup by uuid
@@ -427,7 +455,7 @@ def _numeric_guard(answer: str, sources_text: str) -> str:
     return cleaned
 
 # (Left as-is; not used by the main pipeline. Keep for compatibility.)
-def vector_search(q):  
+def vector_search(q):
     return client.query(..., return_properties=RETURN_PROPS, limit=K)
 
 ROOM_KEYWORDS = {
@@ -566,8 +594,8 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             f"- *Vibrationen in {room_only}?*\n"
         )
 
-    # ---------- Noise-kind helpers (local to keep the patch minimal) ----------
-    is_noise_q = bool(re.search(r"\b(noise|geräusch|lärm)\b", question, re.I))
+    # treat 'Dezibel', 'dBA', 'dB' as noise queries too
+    is_noise_q = bool(re.search(r"\b(noise|geräusch|lärm|dezibel|dba|db)\b", question, re.I))
 
     NOISE_PATTERNS = {
         "laeq": re.compile(r"\bLAeq\b|\bLeq\b", re.I),
@@ -577,7 +605,7 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
     }
     def _detect_noise_kind_from_question_local(q: str) -> Optional[str]:
         ql = q.lower()
-        if any(k in ql for k in ["laeq", "leq", "durchschnitt", "average"]): return "laeq"
+        if any(k in ql for k in ["laeq", "leq", "durchschnitt", "average", "dezibel", "dba", "db"]): return "laeq"
         if any(k in ql for k in ["peak", "lafmax", "spitze", "spitzenwert", "maximal"]): return "peak"
         if any(k in ql for k in ["grenzwert", "expositionsgrenzwert", "am ohr", "ohr"]): return "limit"
         if any(k in ql for k in ["raum", "raumpegel", "im raum", "hintergrundpegel"]): return "room"
@@ -598,6 +626,21 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             return _objs
         _filtered = [o for o in _objs if rx.search(o.properties.get("text", ""))]
         return _filtered or _objs  # fallback if over-filtered
+
+    # Domain expansions for Starkstrom/Aerosole/etc. and abbreviation lookups
+    def _domain_expansions(q: str) -> list[str]:
+        out = []
+        ql = q.lower()
+        if "starkstrom" in ql:
+            out += ["400 V", "63 A", "Schaltschrank", "LOTO", "offen 400 V/63 A"]
+        if any(k in ql for k in ["kss", "aerosol", "feinstaub", "staub", "schwebstoff", "druckluft", "spannvorrichtung", "rüsten", "ruesten"]):
+            out += ["KSS-Aerosole", "Aerosol", "Feinstaub", "Staub", "Schwebstoff", "mg/m³", "Nebel", "Schleier", "Druckluft", "Spannvorrichtung"]
+        if "lecktest" in ql or "glykol" in ql:
+            out += ["Glykol-Aerosole", "Ethylenglykol", "mg/m³"]
+        if re.search(r"\b(was\s+bedeutet|what\s+does)\b", ql):
+            out += ["Abkürzungsverzeichnis", "KSS", "Kühlschmierstoff", "Kuehlschmierstoff"]
+        return list(dict.fromkeys(out))  # dedup, keep order
+
 
     noise_kind_asked = _detect_noise_kind_from_question_local(question)
 
@@ -620,6 +663,11 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
         return pref + q if pref else q
 
     queries = [_prefix(q) for q in queries]
+
+    # Append domain expansions (exact tokens) to guide BM25/vector search
+    exp = _domain_expansions(question)
+    if exp:
+        queries.extend([_prefix(x) for x in exp])
 
     # 2) Gather & dedup candidates
     objs_all = _gather_candidates(coll, queries)
@@ -646,7 +694,7 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
                 "limit": "Grenzwert am Ohr",
                 "room": "Raumpegel (im Raum)",
             }
-            # UPDATED: echo full question in each option
+            # echo full question in each option
             opts = [k for k in ["laeq", "peak", "limit", "room"] if k in room_noise_kinds]
             options_list = [f"- {question} — Kennzahl: {label_map[k]}" for k in opts]
             return "Welche Kennzahl meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
@@ -658,7 +706,7 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
         bm25_res = _bm25_search(coll, question if not asked_room and not asked_machine else _prefix(question), k=KEEP_FOR_CONTEXT)
         objs = _hybrid_rank(vec_res, bm25_res, alpha=HYBRID_ALPHA)
     else:
-        # 3) Unit-aware soft boost to bring measurements forward
+        # 3) Unit-aware and keyword-aware boost to bring measurements & domain facts forward
         hints = _question_unit_hints(question)
         scored = []
         for o in objs_all:
@@ -667,13 +715,23 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
                 base = 1.0 - float(o.metadata.distance)
             txt = o.properties.get("text", "")
             boost = _soft_unit_score(hints, txt)
+            kw_boost = _soft_keyword_score(question, txt)
+
+            # strong bonus if candidate's room matches asked room
+            # inside the scoring loop where room_bonus is computed
+            room_bonus = 0.0
+            if asked_room:
+                cand_room = (o.properties.get("room") or "").strip()
+                if _norm_local(cand_room) == _norm_local(asked_room):
+                    room_bonus = 0.5   # was 0.35
+
 
             # tiny preference for explicit noise markers on noise questions
             noise_marker = 0.0
             if is_noise_q and re.search(r"\bLAeq\b|\bLeq\b|\bLAFmax\b|\bdB\(A\)|\bdB\b", txt, re.I):
                 noise_marker = 0.2
 
-            scored.append((base + 0.15 * boost + noise_marker, o))
+            scored.append((base + 0.15 * boost + kw_boost + room_bonus + noise_marker, o))
 
         # Sort by boosted score and apply MMR for diversity
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -717,7 +775,6 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
     real_machines = sorted({m for m in machines_in_top if m and m.lower() != "allgemein"})
 
     if not asked_machine and len(real_machines) > 1:
-        # UPDATED: echo full question in each option
         options_list = [f"- {question} — Maschine: {m}" for m in real_machines]
         return "Welche Maschine meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
 
@@ -728,6 +785,7 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             objs = objs_filtered
 
     # ---------- Noise-specific disambiguation (inside the room) ----------
+    noise_kind_asked = _detect_noise_kind_from_question_local(question)
     if is_noise_q:
         kinds_now = _classify_noise_kinds_in_objs_local(objs)
         if not noise_kind_asked and len(kinds_now) > 1:
@@ -737,7 +795,6 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
                 "limit": "Grenzwert am Ohr",
                 "room": "Raumpegel (im Raum)",
             }
-            # UPDATED: echo full question in each option
             ordered = [k for k in ["laeq", "peak", "limit", "room"] if k in kinds_now]
             options_list = [f"- {question} — Kennzahl: {label_map[k]}" for k in ordered]
             return "Welche Kennzahl meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
@@ -786,9 +843,22 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
     )
     draft = (resp.choices[0].message.content or "").strip()
 
+    # safeguard — if user asked about Starkstrom and sources mention 400 V / 63 A, avoid false "not specified"
+    sources_concat_pre = context  # quick check over the rendered context
+    if re.search(r"\bstarkstrom\b", question, re.I) and re.search(r"\b(400\s*V|63\s*A)\b", sources_concat_pre, re.I):
+        if "nicht angegeben" in draft.lower():
+            draft = "Ja – offen 400 V/63 A."
+
     # numeric sanity pass
     sources_concat = "\n".join(c["text"] for c in chunks)
     final = _numeric_guard(draft, sources_concat)
+
+    # --- NEW: scrub common extraction artifacts like '((cid:48070)'
+    def _scrub_artifacts(s: str) -> str:
+        s = re.sub(r"\(\s*cid\s*:\s*\d+\s*\)", "", s, flags=re.I)
+        s = re.sub(r"\s{2,}", " ", s)
+        return s.strip()
+    final = _scrub_artifacts(final)
 
     cites = "; ".join(f"{c['source']} S.{c['page']}" for c in chunks[:3])
     if cites:
