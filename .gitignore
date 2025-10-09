@@ -1,3 +1,8 @@
 server/.env
-server/waviate_rag/env/
+client/.env.local
+**/__pycache__/
+*.py[cod]
+*.pyo
+.venv/
 server/waviate_rag/.venv/
+node_modules/

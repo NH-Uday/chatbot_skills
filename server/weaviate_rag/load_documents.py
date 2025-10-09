@@ -136,7 +136,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-
 #python load_documents.py "docs/2025-08-18_FB 1 NEU.pdf" Chatbot_FB1
 # or, using the key:
 #python load_documents.py "docs/2025-08-18_FB 1 NEU.pdf" FB1
