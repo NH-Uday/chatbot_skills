@@ -14,6 +14,7 @@ from app.services.weaviate_setup import (
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 import time
+import re
 
 SESSION_TTL_SECONDS = 60 * 60  # 1 hour; adjust as needed
 
@@ -24,6 +25,8 @@ class SessionState:
     last_noise_kind: Optional[str] = None
     qas: List[tuple[str, str]] = field(default_factory=list)
     touched_at: float = field(default_factory=lambda: time.time())
+    pending_glossary_term: Optional[str] = None
+    last_glossary_term: Optional[str] = None
 
 SESSIONS: Dict[str, SessionState] = {}
 
@@ -55,34 +58,116 @@ def _detect_noise_kind(q: str) -> Optional[str]:
     if any(k in ql for k in ["raum", "raumpegel", "im raum", "hintergrundpegel"]): return "room"
     return None
 
+# --- Special-case list-request blocker --------------------------------------
+SPECIAL_LIST_REPLY = (
+    "Tut mir leid, diese Frage kann ich dir so nicht beantworten. "
+    "Bitte gib einen konkreten Arbeitsbereich oder eine Tätigkeit an, "
+    "auf die sich die Exposition bezieht."
+)
+
+_LIST_VERBS = r"(?:auflisten|liste(?:n)?|nennen|zeigen|aufzählen|aufzaehlen)"
+_ALL = r"(?:alle|sämtliche|saemtliche)"
+_EXPO = r"(?:exposition(?:en)?)"
+_COLOR = r"(?:farblich\s+markiert(?:e|en)?)"
+_AREAS = r"(?:arbeitsbereich(?:e)?|tätigkeit(?:en)?|taetigkeit(?:en)?)"
+_AUFF = r"(?:auffälligkeit(?:en)?|auffaelligkeit(?:en)?|auffällige\s+exposition(?:en)?|auffaellige\s+exposition(?:en)?)"
+
+_SPECIAL_PATTERNS = [
+    # “alle Expositionen …”
+    re.compile(rf"\b{_ALL}.*{_EXPO}\b.*(?:{_LIST_VERBS})?", re.I),
+    re.compile(rf"\b(?:{_LIST_VERBS}).*{_ALL}.*{_EXPO}\b", re.I),
+    # “alle farblich markierten Expositionen/Arbeitsbereiche/Tätigkeiten …”
+    re.compile(rf"\b{_ALL}.*{_COLOR}.*(?:{_EXPO}|{_AREAS})\b.*(?:{_LIST_VERBS})?", re.I),
+    re.compile(rf"\b(?:{_LIST_VERBS}).*{_ALL}.*{_COLOR}.*(?:{_EXPO}|{_AREAS})\b", re.I),
+    # “alle Auffälligkeiten / auffälligen Expositionen …”
+    re.compile(rf"\b{_ALL}.*{_AUFF}\b.*(?:{_LIST_VERBS})?", re.I),
+    re.compile(rf"\b(?:{_LIST_VERBS}).*{_ALL}.*{_AUFF}\b", re.I),
+]
+
+def _is_blocked_list_request(raw_q: str) -> bool:
+    q = (raw_q or "").strip().lower()
+    # strip any short “prefix: …” users might type
+    q = re.sub(r"^[^:]{1,40}:\s*", "", q)
+    return any(p.search(q) for p in _SPECIAL_PATTERNS)
+
 def _apply_session_context(raw_q: str, st: SessionState) -> str:
     q = raw_q.strip()
+
+    # --- Case 1: "Ja"/"Yes" after glossary prompt ---
+    if re.fullmatch(r"(ja|yes)[\.\!\s]*", q, re.I) and st.pending_glossary_term:
+        q = f"{st.pending_glossary_term} Abkürzungsverzeichnis"
+
+    # --- Case 2: "Nein"/"No" cancels glossary clarification ---
+    if re.fullmatch(r"(nein|no)[\.\!\s]*", q, re.I):
+        st.pending_glossary_term = None
+        # fall through → regular context search
+
+    # --- Case 3: Bare glossary-like term (word only) ---
+    if re.fullmatch(r"[A-ZÄÖÜa-zäöüß0-9\/\-]{2,}$", q, re.I):
+        # Ask if user wants glossary info about that term
+        st.pending_glossary_term = q.upper()
+        return (
+            f"Meinen Sie das Abkürzungsverzeichnis für '{q.upper()}'?\n"
+            f"- Ja, **{q.upper()} Abkürzungsverzeichnis**\n"
+            f"- Nein, Messungen/Kontext anzeigen"
+        )
+
+    # --- Existing prefixing logic (rooms, noise kinds, etc.) ---
     asked_room = detect_room_from_question(q) or st.last_room
     asked_machine = pick_machine_from_question(q) or st.last_machine
     nk = _detect_noise_kind(q) or st.last_noise_kind
 
     prefix = []
-    if asked_room:    prefix.append(asked_room)
-    if asked_machine: prefix.append(asked_machine)
-    if nk == "laeq":    prefix.append("LAeq")
-    elif nk == "peak":  prefix.append("Peak LAFmax")
-    elif nk == "limit": prefix.append("Expositionsgrenzwert am Ohr")
-    elif nk == "room":  prefix.append("Raumpegel")
+    if asked_room:
+        prefix.append(asked_room)
+    if asked_machine:
+        prefix.append(asked_machine)
+    if nk == "laeq":
+        prefix.append("LAeq")
+    elif nk == "peak":
+        prefix.append("Peak LAFmax")
+    elif nk == "limit":
+        prefix.append("Expositionsgrenzwert am Ohr")
+    elif nk == "room":
+        prefix.append("Raumpegel")
 
     return (": ".join(prefix) + ": " + q) if prefix else q
 
-def _update_session_from_question_and_answer(q: str, a: str, st: SessionState):
+def _update_session_from_question_and_answer(q: str, a: str | None, st: SessionState):
     room = detect_room_from_question(q)
     mach = pick_machine_from_question(q)
     nk = _detect_noise_kind(q)
 
-    if room: st.last_room = room
-    if mach: st.last_machine = mach
-    if nk:   st.last_noise_kind = nk
+    if room:
+        st.last_room = room
+    if mach:
+        st.last_machine = mach
+    if nk:
+        st.last_noise_kind = nk
 
-    st.qas.append((q, a))
+    # --- Safely handle None answers & glossary tracking ---
+    if isinstance(a, str) and a:
+        # Capture glossary clarification prompt
+        m = re.search(r"Abk(?:ürz|uerz)ungsverzeichnis\s+für\s+'([^']+)'", a, re.I)
+        if m:
+            st.pending_glossary_term = m.group(1).strip().upper()
+
+        # Clear pending if a definition was given
+        if re.search(r"'\s*([A-ZÄÖÜ0-9\/\-]{2,})\s*'\s*(?:bedeutet|means)\s*:", a, re.I):
+            st.pending_glossary_term = None
+
+        # Track last glossary term seen in answer (helps handle bare terms)
+        g = re.search(r"'([A-ZÄÖÜa-zäöüß0-9\/\-]+)'\s*(?:bedeutet|means)", a)
+        if g:
+            st.last_glossary_term = g.group(1).strip()
+    else:
+        # If answer is None or empty, clear pending glossary safely
+        st.pending_glossary_term = None
+
+    st.qas.append((q, a or ""))
     if len(st.qas) > 8:
         st.qas[:] = st.qas[-8:]
+
 # -----------------------------------------------------------------------------
 
 
@@ -111,6 +196,10 @@ app.add_middleware(
 # Generic endpoint (accepts 'target')
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    # --- Early guard for “list all …” special cases
+    if _is_blocked_list_request(req.question):
+        return {"answer": SPECIAL_LIST_REPLY}
+
     st = _get_state(req.session_id or "default")
     augmented = _apply_session_context(req.question, st)
     answer = retrieve_answer(augmented, target=req.target)
@@ -120,6 +209,9 @@ async def chat(req: ChatRequest):
 # Dedicated endpoints
 @app.post("/chat/fb1")
 async def chat_fb1(req: ChatRequest):
+    if _is_blocked_list_request(req.question):
+        return {"answer": SPECIAL_LIST_REPLY}
+
     st = _get_state(req.session_id or "default")
     augmented = _apply_session_context(req.question, st)
     answer = retrieve_answer(augmented, target="FB1")
@@ -128,6 +220,9 @@ async def chat_fb1(req: ChatRequest):
 
 @app.post("/chat/fb2")
 async def chat_fb2(req: ChatRequest):
+    if _is_blocked_list_request(req.question):
+        return {"answer": SPECIAL_LIST_REPLY}
+
     st = _get_state(req.session_id or "default")
     augmented = _apply_session_context(req.question, st)
     answer = retrieve_answer(augmented, target="FB2")
@@ -136,6 +231,9 @@ async def chat_fb2(req: ChatRequest):
 
 @app.post("/chat/fb3")
 async def chat_fb3(req: ChatRequest):
+    if _is_blocked_list_request(req.question):
+        return {"answer": SPECIAL_LIST_REPLY}
+
     st = _get_state(req.session_id or "default")
     augmented = _apply_session_context(req.question, st)
     answer = retrieve_answer(augmented, target="FB3")

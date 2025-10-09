@@ -21,6 +21,10 @@ CLASS_FB1 = (os.getenv("WEAVIATE_CLASS_FB1") or "Chatbot_FB1").strip()
 CLASS_FB2 = (os.getenv("WEAVIATE_CLASS_FB2") or "Chatbot_FB2").strip()
 CLASS_FB3 = (os.getenv("WEAVIATE_CLASS_FB3") or "Chatbot_FB3").strip()
 
+# ======= NEW: Glossary class name =======
+# Override with WEAVIATE_CLASS_GLOSSARY=GlossaryEntry (or your preferred name)
+GLOSSARY_CLASS = (os.getenv("WEAVIATE_CLASS_GLOSSARY") or "GlossaryEntry").strip()
+
 CLASS_NAMES: List[str] = [CLASS_FB1, CLASS_FB2, CLASS_FB3]
 
 # Handy mapping for API/UI layers using dropdown keys
@@ -92,7 +96,7 @@ def _list_collection_names() -> List[str]:
         return list(cols)
 
 def _vector_index_config():
-    
+    # HNSW with COSINE distance (fallbacks for older client signatures)
     try:
         return Configure.VectorIndex.hnsw(distance=VectorDistances.COSINE)
     except TypeError:
@@ -102,7 +106,7 @@ def _vector_index_config():
             return Configure.VectorIndex.hnsw()  # fall back to defaults
 
 def _vectorizer_config():
-    
+    # Keep "none" to match your existing setup (hybrid/BM25 + your own embeddings if any)
     return Configure.Vectorizer.none()
 
 def _create_collection_if_missing(name: str) -> None:
@@ -115,19 +119,40 @@ def _create_collection_if_missing(name: str) -> None:
             Property(name="text", data_type=DataType.TEXT),
             Property(name="source", data_type=DataType.TEXT),
             Property(name="page", data_type=DataType.INT),
-            Property(name="room", data_type=DataType.TEXT),    
-            Property(name="machine", data_type=DataType.TEXT),  
+            Property(name="room", data_type=DataType.TEXT),    # optional metadata
+            Property(name="machine", data_type=DataType.TEXT), # optional metadata
         ],
-        vectorizer_config=_vectorizer_config(),      
-        vector_index_config=_vector_index_config(),  
+        vectorizer_config=_vectorizer_config(),
+        vector_index_config=_vector_index_config(),
         description=f"RAG chunks for {name}",
     )
     print(f"✅ Created schema for '{name}'")
 
+# ======= NEW: Glossary schema helpers =======
+
+def _create_glossary_if_missing() -> None:
+    existing = _list_collection_names()
+    if GLOSSARY_CLASS in existing:
+        return
+    client.collections.create(
+        name=GLOSSARY_CLASS,
+        properties=[
+            Property(name="term",       data_type=DataType.TEXT),  # store UPPERCASE normalized
+            Property(name="definition", data_type=DataType.TEXT),
+            Property(name="source",     data_type=DataType.TEXT),
+            Property(name="page",       data_type=DataType.INT),
+        ],
+        vectorizer_config=_vectorizer_config(),
+        vector_index_config=_vector_index_config(),
+        description="Structured glossary (Abkürzungsverzeichnis) entries for fast lookups",
+    )
+    print(f"✅ Created schema for '{GLOSSARY_CLASS}'")
+
 def ensure_collections() -> None:
-    """Ensure all three isolated collections (FB1/FB2/FB3) exist."""
+    """Ensure all three isolated collections (FB1/FB2/FB3) exist, plus the glossary."""
     for name in CLASS_NAMES:
         _create_collection_if_missing(name)
+    _create_glossary_if_missing()  # <-- ensure glossary exists too
 
 def get_collection(name: str):
     """Return a collection by exact class name (ensuring it exists)."""
@@ -144,6 +169,17 @@ def class_from_key(key: str) -> str:
 def get_collection_by_key(key: str):
     """Return a collection using the dropdown key ('FB1' | 'FB2' | 'FB3')."""
     return get_collection(class_from_key(key))
+
+# ======= NEW: Glossary collection getters =======
+
+def ensure_glossary_collection() -> None:
+    """Ensure the glossary collection exists (called by ensure_collections, but usable standalone)."""
+    _create_glossary_if_missing()
+
+def get_glossary_collection():
+    """Return the glossary collection object (ensuring it exists)."""
+    ensure_glossary_collection()
+    return client.collections.get(GLOSSARY_CLASS)
 
 def close_client():
     try:

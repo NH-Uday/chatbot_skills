@@ -4,6 +4,7 @@ from typing import List, Dict, Tuple, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 from weaviate.classes.query import MetadataQuery
+from app.services.weaviate_setup import get_glossary_collection
 from typing import List, Dict, Any, Optional
 
 # New multi-bot helpers (backward-compatible)
@@ -572,6 +573,159 @@ def _resolve_collection(target: Optional[str]):
 
 def retrieve_answer(question: str, target: Optional[str] = None) -> str:
     coll = _resolve_collection(target)
+    print(f"🔍 retrieve_answer called with: {question!r} for {target}")
+    final = ""  # always initialize to avoid UnboundLocalError
+
+    # ---------- BEGIN: Glossary helpers (must be defined before use) ----------
+    _ABBR_Q_PATTERNS = [
+        re.compile(r"\bwas\s+bedeutet\s+([A-ZÄÖÜa-zäöüß0-9\/\-]+)\??", re.I),
+        re.compile(r"\bwhat\s+does\s+([A-ZÄÖÜa-zäöüß0-9\/\-]+)\s+mean\??", re.I),
+
+        # Common German ways to ask for a glossary/abbreviation
+        re.compile(r"\babk(?:ürz|uerz)ung\s+für\s+([A-ZÄÖÜa-zäöüß0-9\/\-]+)\??", re.I),
+        re.compile(r"\babk\.\s*für\s+([A-ZÄÖÜa-zäöüß0-9\/\-]+)\??", re.I),
+        re.compile(r"\bwofür\s+steht\s+([A-ZÄÖÜa-zäöüß0-9\/\-]+)\??", re.I),
+        re.compile(r"\b([A-ZÄÖÜa-zäöüß0-9\/\-]+)\s+steht\s+für\b", re.I),
+        re.compile(r"\bwas\s+hei(?:ß|ss)t\s+([A-ZÄÖÜa-zäöüß0-9\/\-]+)\??", re.I),
+        re.compile(r"\bbedeutung\s+von\s+([A-ZÄÖÜa-zäöüß0-9\/\-]+)\??", re.I),
+
+        # NEW: “Abkürzung <TERM>” / “Abk. <TERM>” (no “für”)
+        re.compile(r"\babk(?:\.|(?:ürz|uerz)ung)\s+([A-ZÄÖÜa-zäöüß0-9\/\-]{2,})\b", re.I),
+
+        # Plain token fallback
+        re.compile(r"^\s*([A-ZÄÖÜ0-9\/\-]{2,})\s*\??\s*$"),
+    ]
+
+    def _clean_markdown(s: str) -> str:
+        return re.sub(r"[*_`]+", "", s or "")
+
+    # --- Use a cleaned copy for glossary parsing (keep 'question' intact for retrieval) ---
+    question_glossary = re.sub(r"^(?:[^:]+:\s*){1,3}", "", question).strip()
+
+    def _extract_abbrev_term_local(q: str) -> Optional[str]:
+        s = _clean_markdown(q).strip()
+        # strip trailing "in <room>" to avoid misdetection (e.g., "… in CNC-Fräserei")
+        s = re.sub(r"\s+in\s+[^\n\r]+$", "", s, flags=re.I)
+        for rx in _ABBR_Q_PATTERNS:
+            m = rx.search(s)
+            if m:
+                term = (m.group(1) or "").strip(" :–-")
+                return term.upper() if re.fullmatch(r"[A-ZÄÖÜ0-9\/\-]{2,}", term, re.I) else term
+        # bare single-term fallback ("KSS", "Kühlschmierstoff", …)
+        if re.fullmatch(r"[A-ZÄÖÜa-zäöüß0-9\/\-]{2,}", s):
+            return s.upper()
+        return None
+    # ---------------------------------------------------------------------------
+
+    def _is_definition_like(defn: str) -> bool:
+        d = (defn or "").strip()
+        if not d:
+            return False
+        if re.match(r"^[\d\.\,\s]+", d):
+            return False
+        early = d[:32]
+        if re.search(r"\b(mg\/?m[23]|dB\(A\)|\bdB\b|LAeq|LAFmax|%|°C|V|A)\b", early, re.I):
+            return False
+        return True
+
+    def _pick_glossary_page_objects(collection) -> list:
+        bm1 = _bm25_search(collection, "Abkürzungsverzeichnis", k=max(KEEP_FOR_CONTEXT * 3, 30))
+        objs = list(getattr(bm1, "objects", []) or [])
+        if not objs:
+            bm2 = _bm25_search(collection, "Glossar", k=max(KEEP_FOR_CONTEXT * 3, 30))
+            objs = list(getattr(bm2, "objects", []) or [])
+        objs.sort(key=lambda o: int(o.properties.get("page") or 0), reverse=True)
+        return objs[:12]
+
+    def _lookup_abbrev_on_last_page_local(collection, term: str) -> Optional[tuple[str, str, int]]:
+        line_rx = re.compile(rf"(?im)^[\s\-•]*{re.escape(term)}\s*(?:[:=–\-]\s+|\s+)(.+?)\s*$")
+        inline_rx = re.compile(rf"(?i){re.escape(term)}\s*[:=\-–]\s*(.+?)\s*(?:\n|$)")
+
+        def _scan_objs(objs):
+            for o in objs:
+                txt = re.sub(r"\(\s*cid\s*:\s*\d+\s*\)", "", o.properties.get("text") or "", flags=re.I)
+                m = line_rx.search(txt) or inline_rx.search(txt)
+                if m:
+                    definition = m.group(1).strip(" \u00a0:–-")
+                    if _is_definition_like(definition):
+                        return (definition, o.properties.get("source") or "", int(o.properties.get("page") or 0))
+            return None
+
+        objs = _pick_glossary_page_objects(collection)
+        hit = _scan_objs(objs)
+        if hit:
+            return hit
+        bm = _bm25_search(collection, term, k=max(KEEP_FOR_CONTEXT * 8, 80))
+        objs2 = list(getattr(bm, "objects", []) or [])
+        objs2.sort(key=lambda o: int(o.properties.get("page") or 0), reverse=True)
+        return _scan_objs(objs2[:40])
+
+    def _lookup_glossary_structured(term_upper: str) -> Optional[tuple[str, str, int]]:
+        try:
+            from app.services.weaviate_setup import get_glossary_collection
+            import weaviate as _wv
+        except Exception:
+            return None
+        try:
+            gc = get_glossary_collection()
+            res = gc.query.fetch_objects(
+                filters=_wv.classes.query.Filter.by_property("term").equal(term_upper),
+                limit=1,
+                return_properties=["term", "definition", "source", "page"],
+            )
+            if res and getattr(res, "objects", None):
+                o = res.objects[0].properties
+                return (o.get("definition", ""), o.get("source", ""), int(o.get("page") or 0))
+        except Exception:
+            return None
+        return None
+    # ---------- END: Glossary helpers ----------------------------------------
+
+    # ---------- BEGIN: Glossary fast-path & clarification ---------------------
+    ql = _clean_markdown(question_glossary or "").lower()
+    term_for_glossary = _extract_abbrev_term_local(question_glossary or "")
+
+    explicit_glossary = any([
+        "abkürzungsverzeichnis" in ql, "abkuerzungsverzeichnis" in ql, "glossar" in ql,
+        "abkürzung" in ql, "abkuerzung" in ql, "abk." in ql, "kurzform" in ql,
+        "kürzel" in ql, "kuerzel" in ql, "steht für" in ql, "wofür steht" in ql,
+        "wofuer steht" in ql, "bedeutung" in ql, "definition" in ql
+    ])
+
+    # If glossary intent but we couldn't detect a term → ask politely
+    if explicit_glossary and not term_for_glossary:
+        return ("Welche Abkürzung meinst du genau?\n"
+                "Beispiele:\n"
+                "- Abkürzung KSS\n"
+                "- Was bedeutet KSS?\n"
+                "- Wofür steht LärmVibrationsArbSchV?")
+
+    if term_for_glossary and explicit_glossary:
+        hit = _lookup_glossary_structured(term_for_glossary.upper())
+        if not hit:
+            hit = _lookup_abbrev_on_last_page_local(coll, term_for_glossary)
+        if hit:
+            definition, source, page = hit
+            return f"'{term_for_glossary}' bedeutet: {definition}.\n\n— Sources: {source} p.{page}"
+        return f"Entschuldigung – ich konnte kein Ergebnis für '{term_for_glossary}' finden."
+
+    likely_room_or_noise = bool(re.search(r"\b(cnc|raum|montage|werkzeug|schleif|prüfstand|pruefstand)\b", ql)) \
+                           or bool(re.search(r"\b(noise|geräusch|lärm|dezibel|dba|db|laeq|lafmax|peak)\b", ql))
+
+    if term_for_glossary and not explicit_glossary:
+        if likely_room_or_noise:
+            return (
+                f"Meinen Sie das Abkürzungsverzeichnis  für '{term_for_glossary}'?\n"
+                f"- Ja, **{term_for_glossary} Abkürzungsverzeichnis**\n"
+                f"- Nein, Messungen/Kontext anzeigen"
+            )
+        hit = _lookup_glossary_structured(term_for_glossary.upper())
+        if not hit:
+            hit = _lookup_abbrev_on_last_page_local(coll, term_for_glossary)
+        if hit:
+            definition, source, page = hit
+            return f"'{term_for_glossary}' bedeutet: {definition}.\n\n— Sources: {source} p.{page}"
+    # ---------- END: Glossary fast-path & clarification -----------------------
 
     # --- normalization helper (local & minimal) ---
     def _norm_local(s: Optional[str]) -> str:
@@ -604,11 +758,11 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
         "room": re.compile(r"\bim\s*Raum\b|\bRaumpegel\b|\bHintergrundpegel\b", re.I),
     }
     def _detect_noise_kind_from_question_local(q: str) -> Optional[str]:
-        ql = q.lower()
-        if any(k in ql for k in ["laeq", "leq", "durchschnitt", "average", "dezibel", "dba", "db"]): return "laeq"
-        if any(k in ql for k in ["peak", "lafmax", "spitze", "spitzenwert", "maximal"]): return "peak"
-        if any(k in ql for k in ["grenzwert", "expositionsgrenzwert", "am ohr", "ohr"]): return "limit"
-        if any(k in ql for k in ["raum", "raumpegel", "im raum", "hintergrundpegel"]): return "room"
+        ql2 = q.lower()
+        if any(k in ql2 for k in ["laeq", "leq", "durchschnitt", "average", "dezibel", "dba", "db"]): return "laeq"
+        if any(k in ql2 for k in ["peak", "lafmax", "spitze", "spitzenwert", "maximal"]): return "peak"
+        if any(k in ql2 for k in ["grenzwert", "expositionsgrenzwert", "am ohr", "ohr"]): return "limit"
+        if any(k in ql2 for k in ["raum", "raumpegel", "im raum", "hintergrundpegel"]): return "room"
         return None
 
     def _classify_noise_kinds_in_objs_local(_objs) -> set[str]:
@@ -630,17 +784,16 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
     # Domain expansions for Starkstrom/Aerosole/etc. and abbreviation lookups
     def _domain_expansions(q: str) -> list[str]:
         out = []
-        ql = q.lower()
-        if "starkstrom" in ql:
+        ql3 = q.lower()
+        if "starkstrom" in ql3:
             out += ["400 V", "63 A", "Schaltschrank", "LOTO", "offen 400 V/63 A"]
-        if any(k in ql for k in ["kss", "aerosol", "feinstaub", "staub", "schwebstoff", "druckluft", "spannvorrichtung", "rüsten", "ruesten"]):
+        if any(k in ql3 for k in ["kss", "aerosol", "feinstaub", "staub", "schwebstoff", "druckluft", "spannvorrichtung", "rüsten", "ruesten"]):
             out += ["KSS-Aerosole", "Aerosol", "Feinstaub", "Staub", "Schwebstoff", "mg/m³", "Nebel", "Schleier", "Druckluft", "Spannvorrichtung"]
-        if "lecktest" in ql or "glykol" in ql:
+        if "lecktest" in ql3 or "glykol" in ql3:
             out += ["Glykol-Aerosole", "Ethylenglykol", "mg/m³"]
-        if re.search(r"\b(was\s+bedeutet|what\s+does)\b", ql):
+        if re.search(r"\b(was\s+bedeutet|what\s+does)\b", ql3):
             out += ["Abkürzungsverzeichnis", "KSS", "Kühlschmierstoff", "Kuehlschmierstoff"]
         return list(dict.fromkeys(out))  # dedup, keep order
-
 
     noise_kind_asked = _detect_noise_kind_from_question_local(question)
 
@@ -657,7 +810,6 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
         elif nk == "peak":  pref += "Peak LAFmax: "
         elif nk == "limit": pref += "Expositionsgrenzwert am Ohr: "
         elif nk == "room":  pref += "Raumpegel: "
-        # optional: default bias for generic "noise level" phrasing
         if is_noise_q and re.search(r"\blevel\b|\bniveau\b", q, re.I) and "LAeq" not in pref:
             pref += "LAeq: "
         return pref + q if pref else q
@@ -694,7 +846,6 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
                 "limit": "Grenzwert am Ohr",
                 "room": "Raumpegel (im Raum)",
             }
-            # echo full question in each option
             opts = [k for k in ["laeq", "peak", "limit", "room"] if k in room_noise_kinds]
             options_list = [f"- {question} — Kennzahl: {label_map[k]}" for k in opts]
             return "Welche Kennzahl meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
@@ -716,34 +867,22 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             txt = o.properties.get("text", "")
             boost = _soft_unit_score(hints, txt)
             kw_boost = _soft_keyword_score(question, txt)
-
-            # strong bonus if candidate's room matches asked room
-            # inside the scoring loop where room_bonus is computed
             room_bonus = 0.0
             if asked_room:
                 cand_room = (o.properties.get("room") or "").strip()
                 if _norm_local(cand_room) == _norm_local(asked_room):
-                    room_bonus = 0.5   # was 0.35
-
-
-            # tiny preference for explicit noise markers on noise questions
+                    room_bonus = 0.5
             noise_marker = 0.0
             if is_noise_q and re.search(r"\bLAeq\b|\bLeq\b|\bLAFmax\b|\bdB\(A\)|\bdB\b", txt, re.I):
                 noise_marker = 0.2
-
             scored.append((base + 0.15 * boost + kw_boost + room_bonus + noise_marker, o))
 
-        # Sort by boosted score and apply MMR for diversity
         scored.sort(key=lambda x: x[0], reverse=True)
         objs_sorted = [o for _, o in scored]
         objs_mmr = _mmr_select([], objs_sorted, k=max(KEEP_FOR_CONTEXT * 2, 10), lambda_=0.7)
-
-        # 4) LLM rerank top K (final cut)
         objs = _rerank_llm(question, objs_mmr, top_n=KEEP_FOR_CONTEXT)
 
     # ---------- Ambiguity checks BEFORE composing the answer ----------
-
-    # Rooms present in top hits
     rooms_in_top = []
     for o in objs:
         r = (o.properties.get("room") or "").strip()
@@ -751,7 +890,6 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             rooms_in_top.append(r)
     unique_rooms = sorted({r for r in rooms_in_top if r and r.lower() not in {"unklar", "gesamt"}})
 
-    # Improved room clarification: suggest full follow-up questions
     if not asked_room and len(unique_rooms) > 1:
         options = "\n".join(f"- {question} in {r}" for r in unique_rooms)
         return (
@@ -760,13 +898,11 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             f"{options}"
         )
 
-    # If a room is specified (or only one appears), filter to that room to avoid mixing
     if asked_room:
         objs = [o for o in objs if _norm_local(o.properties.get("room")) == _norm_local(asked_room)]
-        if not objs:  # safety fallback
+        if not objs:
             objs = _rerank_llm(question, objs_all[:KEEP_FOR_CONTEXT*2], top_n=KEEP_FOR_CONTEXT)
 
-    # Machine ambiguity (after room disambiguation)
     machines_in_top = []
     for o in objs:
         m = (o.properties.get("machine") or "").strip()
@@ -778,7 +914,6 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
         options_list = [f"- {question} — Maschine: {m}" for m in real_machines]
         return "Welche Maschine meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
 
-    # If machine specified, filter to that machine as well (keeps answer precise)
     if asked_machine:
         objs_filtered = [o for o in objs if _norm_local(o.properties.get("machine")) == _norm_local(asked_machine)]
         if objs_filtered:
@@ -799,11 +934,9 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             options_list = [f"- {question} — Kennzahl: {label_map[k]}" for k in ordered]
             return "Welche Kennzahl meinst du? Antworte mit einer Option:\n" + "\n".join(options_list)
 
-        # Auto-select the single remaining kind
         if not noise_kind_asked and len(kinds_now) == 1:
             noise_kind_asked = next(iter(kinds_now))
 
-        # If user specified a kind, filter and apply robust fallback
         if noise_kind_asked:
             filtered = _filter_objs_by_noise_kind_local(objs, noise_kind_asked)
             if not filtered:
@@ -820,48 +953,54 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
             if filtered:
                 objs = filtered
 
-        # Gentle preference for measurement-bearing text
         dba_rx = re.compile(r"\b(?:dB\(A\)|dB|LAeq|LAFmax|Lärm|Geräusch)\b", re.I)
         objs_dba = [o for o in objs if dba_rx.search(o.properties.get("text", ""))]
         if objs_dba:
             objs = objs_dba
 
     # -----------------------------------------------------------------
+    # Compose context & ask the model (guarded)
+    try:
+        context, chunks = _format_context(objs)
 
-    # Compose context & ask the model
-    context, chunks = _format_context(objs)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Frage: {question}\n\nKontext:\n{context}"},
+        ]
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Frage: {question}\n\nKontext:\n{context}"},
-    ]
+        resp = oa.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.0,
+        )
+        draft = (resp.choices[0].message.content or "").strip()
 
-    resp = oa.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-        temperature=0.0,
-    )
-    draft = (resp.choices[0].message.content or "").strip()
+        # safeguard — if user asked about Starkstrom and sources mention 400 V / 63 A
+        sources_concat_pre = context
+        if re.search(r"\bstarkstrom\b", question, re.I) and re.search(r"\b(400\s*V|63\s*A)\b", sources_concat_pre, re.I):
+            if "nicht angegeben" in draft.lower():
+                draft = "Ja – offen 400 V/63 A."
 
-    # safeguard — if user asked about Starkstrom and sources mention 400 V / 63 A, avoid false "not specified"
-    sources_concat_pre = context  # quick check over the rendered context
-    if re.search(r"\bstarkstrom\b", question, re.I) and re.search(r"\b(400\s*V|63\s*A)\b", sources_concat_pre, re.I):
-        if "nicht angegeben" in draft.lower():
-            draft = "Ja – offen 400 V/63 A."
+        # numeric sanity pass
+        sources_concat = "\n".join(c["text"] for c in chunks)
+        final = _numeric_guard(draft, sources_concat)
 
-    # numeric sanity pass
-    sources_concat = "\n".join(c["text"] for c in chunks)
-    final = _numeric_guard(draft, sources_concat)
+        # scrub common extraction artifacts
+        def _scrub_artifacts(s: str) -> str:
+            s = re.sub(r"\(\s*cid\s*:\s*\d+\\s*\)", "", s, flags=re.I)
+            s = re.sub(r"\s{2,}", " ", s)
+            return s.strip()
+        final = _scrub_artifacts(final)
 
-    # --- NEW: scrub common extraction artifacts like '((cid:48070)'
-    def _scrub_artifacts(s: str) -> str:
-        s = re.sub(r"\(\s*cid\s*:\s*\d+\s*\)", "", s, flags=re.I)
-        s = re.sub(r"\s{2,}", " ", s)
-        return s.strip()
-    final = _scrub_artifacts(final)
+        cites = "; ".join(f"{c['source']} S.{c['page']}" for c in chunks[:3])
+        if cites:
+            final = f"{final}\n\n— Quellen: {cites}"
 
-    cites = "; ".join(f"{c['source']} S.{c['page']}" for c in chunks[:3])
-    if cites:
-        final = f"{final}\n\n— Quellen: {cites}"
+    except Exception as e:
+        print("⚠️ LLM section failed:", repr(e))
+        final = ""
 
+    if not final.strip():
+        final = "Ich habe die Frage nicht eindeutig verstanden. Formuliere sie bitte klarer (z. B. „Abkürzung KSS?“ oder „Was bedeutet KSS?“)."
     return final
+
