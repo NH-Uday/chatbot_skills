@@ -3,20 +3,19 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.services.rag import retrieve_answer
+from app.services.rag import retrieve_answer_with_meta
 from app.services.weaviate_setup import (
     ensure_collections,
     KEY_TO_CLASS,
     close_client,
 )
 
-# --- NEW: session memory primitives -----------------------------------------
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 import time
 import re
 
-SESSION_TTL_SECONDS = 60 * 60  # 1 hour; adjust as needed
+SESSION_TTL_SECONDS = 60 * 60  
 
 @dataclass
 class SessionState:
@@ -168,7 +167,38 @@ def _update_session_from_question_and_answer(q: str, a: str | None, st: SessionS
     if len(st.qas) > 8:
         st.qas[:] = st.qas[-8:]
 
-# -----------------------------------------------------------------------------
+
+CONFIRM_RX = re.compile(
+    r"^\s*ist\s+d(?:as|er|ie)\b.*\bin\s+der\b\s*(?P<room>[^?!.]+)\??\s*$",
+    re.I
+)
+
+def _try_coref_confirmation(raw_q: str, st: SessionState) -> str | None:
+    """
+    Intercept follow-ups like:
+      "Ist das der Handschleifer in der CNC-Fräserei?"
+    and answer Yes/No using session meta without hitting retrieval.
+    """
+    m = CONFIRM_RX.search(raw_q or "")
+    if not m:
+        return None
+    asked_room = (m.group("room") or "").strip()
+    last_room = (st.last_room or "").strip()
+    last_machine = (st.last_machine or "").strip()
+
+    if not last_room and not last_machine:
+        return None  # nothing to confirm
+
+    if asked_room and last_room:
+        if asked_room.lower() == last_room.lower():
+            if last_machine:
+                return f"Ja – bezog sich auf **{last_machine}** in **{last_room}**."
+            return f"Ja – bezog sich auf **{last_room}**."
+        else:
+            if last_machine:
+                return f"Nein – der zuletzt genannte Wert bezog sich auf **{last_machine}** in **{last_room}**, nicht auf **{asked_room}**."
+            return f"Nein – der zuletzt genannte Wert bezog sich auf **{last_room}**, nicht auf **{asked_room}**."
+    return None
 
 
 class ChatRequest(BaseModel):
@@ -193,6 +223,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Helper to call retriever, then update meta-driven session state
+def _answer_and_update(req: ChatRequest, target: str | None, st: SessionState):
+    augmented = _apply_session_context(req.question, st)
+
+    # ⬇️ use the meta-enabled retriever
+    answer, meta_room, meta_machine = retrieve_answer_with_meta(augmented, target=target)
+
+    # Update session memory from META first (what the model actually used)
+    if meta_room:
+        st.last_room = meta_room
+    if meta_machine:
+        st.last_machine = meta_machine
+
+    # Then run the usual lightweight updater (from user's raw question & answer)
+    _update_session_from_question_and_answer(req.question, answer, st)
+
+    return answer
+
 # Generic endpoint (accepts 'target')
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -201,9 +249,15 @@ async def chat(req: ChatRequest):
         return {"answer": SPECIAL_LIST_REPLY}
 
     st = _get_state(req.session_id or "default")
-    augmented = _apply_session_context(req.question, st)
-    answer = retrieve_answer(augmented, target=req.target)
-    _update_session_from_question_and_answer(req.question, answer, st)
+
+    # 1) Intercept yes/no coref confirmation
+    coref = _try_coref_confirmation(req.question, st)
+    if coref:
+        _update_session_from_question_and_answer(req.question, coref, st)
+        return {"answer": coref}
+
+    # 2) Normal flow
+    answer = _answer_and_update(req, req.target, st)
     return {"answer": answer}
 
 # Dedicated endpoints
@@ -213,9 +267,13 @@ async def chat_fb1(req: ChatRequest):
         return {"answer": SPECIAL_LIST_REPLY}
 
     st = _get_state(req.session_id or "default")
-    augmented = _apply_session_context(req.question, st)
-    answer = retrieve_answer(augmented, target="FB1")
-    _update_session_from_question_and_answer(req.question, answer, st)
+
+    coref = _try_coref_confirmation(req.question, st)
+    if coref:
+        _update_session_from_question_and_answer(req.question, coref, st)
+        return {"answer": coref}
+
+    answer = _answer_and_update(req, "FB1", st)
     return {"answer": answer}
 
 @app.post("/chat/fb2")
@@ -224,9 +282,13 @@ async def chat_fb2(req: ChatRequest):
         return {"answer": SPECIAL_LIST_REPLY}
 
     st = _get_state(req.session_id or "default")
-    augmented = _apply_session_context(req.question, st)
-    answer = retrieve_answer(augmented, target="FB2")
-    _update_session_from_question_and_answer(req.question, answer, st)
+
+    coref = _try_coref_confirmation(req.question, st)
+    if coref:
+        _update_session_from_question_and_answer(req.question, coref, st)
+        return {"answer": coref}
+
+    answer = _answer_and_update(req, "FB2", st)
     return {"answer": answer}
 
 @app.post("/chat/fb3")
@@ -235,9 +297,13 @@ async def chat_fb3(req: ChatRequest):
         return {"answer": SPECIAL_LIST_REPLY}
 
     st = _get_state(req.session_id or "default")
-    augmented = _apply_session_context(req.question, st)
-    answer = retrieve_answer(augmented, target="FB3")
-    _update_session_from_question_and_answer(req.question, answer, st)
+
+    coref = _try_coref_confirmation(req.question, st)
+    if coref:
+        _update_session_from_question_and_answer(req.question, coref, st)
+        return {"answer": coref}
+
+    answer = _answer_and_update(req, "FB3", st)
     return {"answer": answer}
 
 # Utility
@@ -249,13 +315,11 @@ async def list_bots():
 async def health():
     return {"status": "ok"}
 
-# --- NEW: reset current session memory ---------------------------------------
 @app.post("/session/reset")
 async def reset_session(session_id: str | None = Query(None, description="session id to reset")):
     sid = session_id or "default"
     SESSIONS.pop(sid, None)
     return {"ok": True}
-# -----------------------------------------------------------------------------
 
 
 from app.services.rag import _resolve_collection, _vector_search, _bm25_search, _embed

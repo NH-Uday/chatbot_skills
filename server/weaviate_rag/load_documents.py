@@ -14,10 +14,10 @@ from app.services.weaviate_setup import (
     close_client,
     class_from_key,     # 'FB1'|'FB2'|'FB3' -> class name
     KEY_TO_CLASS,       # mapping of keys to class names
-    get_glossary_collection,  # NEW: for structured glossary entries
+    get_glossary_collection,  # for structured glossary entries
+    client,             # v4 client (we'll use it for direct inserts)
 )
-from app.services.embedder import embed_and_store  # unchanged
-
+from app.services.embedder import embed_and_store  # existing path (kept)
 
 load_dotenv()
 
@@ -30,13 +30,16 @@ PDF_FB3_ENV = os.getenv("PDF_FB3")
 
 BOT_KEYS = ["FB1", "FB2", "FB3"]
 
+# Toggle the new hi-res extraction path (default ON)
+USE_HIRES = os.getenv("USE_HIRES_EXTRACTION", "1") not in ("0", "false", "False")
 
-# ------------------------ PDF text extraction helpers ------------------------
+# ------------------------ PDF text extraction (legacy, page-wise) ------------------------
 
 def _read_pdf_pages(pdf_path: Path) -> List[str]:
     """
     Return a list of page texts.
-    Tries pdfplumber (best layout/text), falls back to PyPDF2.
+    Tries pdfplumber (better layout/text), falls back to PyPDF2.
+    NOTE: This is used mainly for glossary scraping (fast path).
     """
     texts: List[str] = []
 
@@ -47,7 +50,6 @@ def _read_pdf_pages(pdf_path: Path) -> List[str]:
             for page in pdf.pages:
                 txt = page.extract_text() or ""
                 texts.append(txt)
-        # if at least 1 page extracted, we're good
         if texts:
             return texts
     except Exception:
@@ -64,11 +66,155 @@ def _read_pdf_pages(pdf_path: Path) -> List[str]:
                 txt = ""
             texts.append(txt)
     except Exception:
-        # give up, return empty list
         return []
 
     return texts
 
+# ------------------------ NEW: Layout-aware extraction + chunking ------------------------
+
+def _extract_blocks_hires(pdf_path: Path):
+    """
+    Use unstructured partitioner with layout-aware parsing.
+    Falls back to OCR-only if text layer is messy.
+    """
+    try:
+        from unstructured.partition.pdf import partition_pdf  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "unstructured is not installed. "
+            "Run: pip install \"unstructured[pdf,pytesseract]\" pillow"
+        ) from e
+
+    try:
+        # Try high-res layout aware first
+        return partition_pdf(
+            filename=str(pdf_path),
+            strategy="hi_res",
+            infer_table_structure=True,
+            include_page_breaks=True,
+        )
+    except Exception:
+        # Fallback to OCR-only if needed
+        return partition_pdf(
+            filename=str(pdf_path),
+            strategy="ocr_only",
+            infer_table_structure=True,
+            include_page_breaks=True,
+        )
+
+def _blocks_to_spans(blocks) -> List[Dict[str, Optional[str]]]:
+    """
+    Convert unstructured blocks into plain spans with page info.
+    """
+    spans: List[Dict[str, Optional[str]]] = []
+    for el in blocks:
+        txt = getattr(el, "text", None)
+        if not txt:
+            continue
+        md = getattr(el, "metadata", None)
+        page_no = getattr(md, "page_number", None)
+        spans.append({"text": txt.strip(), "page": int(page_no) if page_no else None})
+    return spans
+
+def _clean_text(s: str) -> str:
+    # Remove common cid garbage and normalize spaces/dashes/superscripts
+    s = re.sub(r"\(\s*cid\s*:\s*\d+\s*\)", "", s, flags=re.I)
+    s = s.replace("\u2013", "-").replace("\u2212", "-").replace("\u00A0", " ")
+    s = s.replace("m³", "m3")
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+def _chunk_spans(
+    spans: List[Dict[str, Optional[str]]],
+    max_len: int = 1000,
+    overlap: int = 150,
+) -> List[Dict[str, Optional[str]]]:
+    """
+    Simple length-based chunking across spans, preserving approximate page locality.
+    """
+    chunks: List[Dict[str, Optional[str]]] = []
+    buf = ""
+    first_page = None
+
+    def flush():
+        nonlocal buf, first_page
+        if buf.strip():
+            chunks.append({"text": buf.strip(), "page": first_page})
+        buf = ""
+        first_page = None
+
+    for sp in spans:
+        t = _clean_text(sp.get("text") or "")
+        if not t:
+            continue
+        candidate = (t + "\n")
+        if not buf:
+            first_page = sp.get("page")
+
+        if len(buf) + len(candidate) <= max_len:
+            buf += candidate
+        else:
+            # flush current
+            flush()
+            # start new with overlap from previous
+            tail = (buf[-overlap:] if buf else "")
+            buf = (tail + candidate) if tail else candidate
+            first_page = sp.get("page")
+
+    flush()
+    return [c for c in chunks if c.get("text")]
+
+def _detect_room(text: str) -> Optional[str]:
+    # Heuristic keywords; expand as you like
+    t = text.lower()
+    if "cnc-fräserei" in t or "cnc fräserei" in t or "cnc-fraeserei" in t or "cnc fraeserei" in t:
+        return "CNC-Fräserei"
+    if "werkzeug" in t and "schleif" in t:
+        return "Werkzeug- & Schleifraum"
+    if "elektro" in t or "schaltschrank" in t:
+        return "Elektro / Schaltschrank"
+    return None
+
+def _detect_machine(text: str) -> Optional[str]:
+    t = text.lower()
+    if "handschleifer" in t:
+        return "Handschleifer"
+    if "bearbeitungszentrum" in t or "fräszentrum" in t or "fraeszentrum" in t:
+        return "Bearbeitungszentrum"
+    return None
+
+def _ingest_hires_chunks(pdf_path: Path, class_name: str) -> int:
+    """
+    Extract hi-res chunks and upsert them directly (BM25-ready).
+    No vectors required (your collection's vectorizer is None).
+    Returns number of objects inserted.
+    """
+    print(f"🔎 hi-res extracting: {pdf_path.name}")
+    blocks = _extract_blocks_hires(pdf_path)
+    spans = _blocks_to_spans(blocks)
+    chunks = _chunk_spans(spans, max_len=1000, overlap=150)
+    if not chunks:
+        print("ℹ️ hi-res produced no chunks; skipping.")
+        return 0
+
+    coll = client.collections.get(class_name)
+    n = 0
+    for ch in chunks:
+        text = ch["text"] or ""
+        page = int(ch["page"]) if ch.get("page") else 1
+        props = {
+            "text": text,
+            "source": pdf_path.name,
+            "page": page,
+            "room": _detect_room(text) or "",
+            "machine": _detect_machine(text) or "",
+        }
+        try:
+            coll.data.insert(properties=props)
+            n += 1
+        except Exception as e:
+            print(f"⚠️ insert failed (page {page}): {e}")
+    print(f"📚 hi-res chunks inserted: {n}")
+    return n
 
 # ------------------------ Glossary (Abkürzungsverzeichnis) -------------------
 
@@ -80,30 +226,18 @@ MEASUREMENT_EARLY_RX = re.compile(
 )
 
 def _is_definition_like(defn: str) -> bool:
-    """
-    Accept textual definitions; reject measurement-style leading content.
-    """
     d = (defn or "").strip()
     if not d:
         return False
-    # reject if starts numerically
-    if re.match(r"^[\d\.\,\s]+", d):
+    if re.match(r"^[\d\.\,\s]+", d):  # starts numeric
         return False
-    # reject if measurement tokens appear *early*
     if MEASUREMENT_EARLY_RX.search(d[:32]):
         return False
     return True
 
-
 def _extract_glossary_entries_from_pages(
     pages: List[str],
 ) -> List[Tuple[str, str, int]]:
-    """
-    Parse glossary-like lines from all pages.
-    Prefer pages that look like Abkürzungsverzeichnis/Glossar
-    but still collect from any page to be robust.
-    Returns list of (TERM_UPPER, DEFINITION, PAGE_NUMBER_1_BASED).
-    """
     results: List[Tuple[str, str, int]] = []
     if not pages:
         return results
@@ -116,7 +250,6 @@ def _extract_glossary_entries_from_pages(
             likely_glossary_idx.add(idx)
 
     def scan_page(text: str, page_no_1b: int) -> Iterable[Tuple[str, str, int]]:
-        # scrub common cid noise
         clean = re.sub(r"\(\s*cid\s*:\s*\d+\s*\)", "", text or "", flags=re.I)
         for m in LINE_RX.finditer(clean):
             term = (m.group(1) or "").strip()
@@ -127,19 +260,19 @@ def _extract_glossary_entries_from_pages(
                 continue
             yield (term.upper(), definition, page_no_1b)
 
-    # Pass 1: scan likely glossary pages first (sorted by descending page number)
+    # Pass 1: likely glossary pages (desc order)
     for idx in sorted(likely_glossary_idx, reverse=True):
         for triple in scan_page(pages[idx], idx + 1):
             results.append(triple)
 
-    # Pass 2: broad scan (all pages), but still useful if headings were not ingested
+    # Pass 2: all pages
     for idx, text in enumerate(pages):
         if idx in likely_glossary_idx:
-            continue  # already scanned
+            continue
         for triple in scan_page(text, idx + 1):
             results.append(triple)
 
-    # Deduplicate by TERM, prefer higher page numbers (more likely last-page glossary)
+    # Deduplicate by TERM, prefer higher page numbers
     best: Dict[str, Tuple[str, str, int]] = {}
     for term_upper, definition, page_no in results:
         prev = best.get(term_upper)
@@ -148,16 +281,10 @@ def _extract_glossary_entries_from_pages(
 
     return list(best.values())
 
-
 def _upsert_glossary_entries(
     pdf_path: Path,
     entries: List[Tuple[str, str, int]],
 ) -> int:
-    """
-    Write entries into `GlossaryEntry` collection:
-    { term: UPPER, definition, source: pdf_filename, page }
-    Returns number of entries written.
-    """
     if not entries:
         return 0
     gc = get_glossary_collection()
@@ -172,19 +299,16 @@ def _upsert_glossary_entries(
             })
             count += 1
         except Exception as e:
-            # keep going; log minimally to stdout
             print(f"⚠️  Glossary insert failed for {term_upper}: {e}")
     return count
 
-
-# ------------------------ Existing ingestion plumbing ------------------------
+# ------------------------ PDF discovery & mapping ----------------------------
 
 def _discover_pdfs(folder: Path) -> List[Path]:
     if not folder.exists():
         print(f"❌ PDF folder not found: {folder}")
         return []
     return sorted([p for p in folder.iterdir() if p.suffix.lower() == ".pdf"])
-
 
 def _pick_by_env_or_pattern(pdfs: List[Path]) -> Dict[str, Optional[Path]]:
     mapping: Dict[str, Optional[Path]] = {"FB1": None, "FB2": None, "FB3": None}
@@ -223,15 +347,34 @@ def _pick_by_env_or_pattern(pdfs: List[Path]) -> Dict[str, Optional[Path]]:
 
     return mapping
 
+# ------------------------ Ingestion orchestration ----------------------------
 
 def _ingest(pdf_path: Path, class_name: str):
-    # 1) Ingest normal RAG chunks (unchanged path)
+    """
+    1) (Existing) Call your embedder pipeline (kept for backward-compat).
+    2) (New) Hi-res extraction + direct inserts for dense BM25 coverage.
+    3) Extract abbreviations/glossary into GlossaryEntry (structured).
+    """
     os.environ["WEAVIATE_CLASS"] = class_name   # for backward-compatible embedder
-    print(f"📥 Indexing: {pdf_path}  ->  {class_name}")
-    embed_and_store(str(pdf_path))
 
-    # 2) Extract & upsert Glossary (Abkürzungsverzeichnis) entries
-    #    This makes abbreviation lookup instant & reliable at query time.
+    print(f"📥 Indexing: {pdf_path}  ->  {class_name}")
+    try:
+        embed_and_store(str(pdf_path))  # existing path (may create few coarse objects)
+    except Exception as e:
+        print(f"⚠️ embed_and_store failed (continuing with hi-res path): {e}")
+
+    # New: hi-res extraction & direct upserts
+    if USE_HIRES:
+        try:
+            inserted = _ingest_hires_chunks(pdf_path, class_name)
+            if inserted == 0:
+                print("ℹ️ No hi-res chunks inserted.")
+        except Exception as e:
+            print(f"⚠️ hi-res ingestion failed: {e}")
+    else:
+        print("ℹ️ USE_HIRES_EXTRACTION=0 → skipped hi-res ingestion.")
+
+    # Glossary extraction (fast page-wise)
     try:
         pages = _read_pdf_pages(pdf_path)
         entries = _extract_glossary_entries_from_pages(pages)
@@ -242,7 +385,6 @@ def _ingest(pdf_path: Path, class_name: str):
             print(f"ℹ️ No glossary-like entries found in {pdf_path.name}")
     except Exception as e:
         print(f"⚠️  Glossary extraction failed for {pdf_path.name}: {e}")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Ingest PDFs into isolated Weaviate classes and extract glossary entries.")
@@ -295,12 +437,17 @@ def main():
         print("✅ Done." if any_ingested else "ℹ️ Nothing ingested.")
 
     finally:
-        close_client()
-
+        try:
+            close_client()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
 
+# Usage:
 # python load_documents.py "docs/2025-08-18_FB 1 NEU.pdf" Chatbot_FB1
 # or, using the key:
 # python load_documents.py "docs/2025-08-18_FB 1 NEU.pdf" FB1
+# Toggle new path off if needed:
+# USE_HIRES_EXTRACTION=0 python load_documents.py "docs/2025-08-18_FB 1 NEU.pdf" FB1
