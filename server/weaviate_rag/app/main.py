@@ -68,25 +68,79 @@ _LIST_VERBS = r"(?:auflisten|liste(?:n)?|nennen|zeigen|aufzählen|aufzaehlen)"
 _ALL = r"(?:alle|sämtliche|saemtliche)"
 _EXPO = r"(?:exposition(?:en)?)"
 _COLOR = r"(?:farblich\s+markiert(?:e|en)?)"
+_COLOR_WORDS = r"(?:rot(?:e|en)?|gelb(?:e|en)?|gr[üu]n(?:e|en)?)"
 _AREAS = r"(?:arbeitsbereich(?:e)?|tätigkeit(?:en)?|taetigkeit(?:en)?)"
+_ROOM_HINTS  = r"(?:im\s+bereich|bereich|raum|cnc|fr[äa]serei|fraeserei|werkzeug|schleif|montage|pr[üu]fstand|pruefstand)"
 _AUFF = r"(?:auffälligkeit(?:en)?|auffaelligkeit(?:en)?|auffällige\s+exposition(?:en)?|auffaellige\s+exposition(?:en)?)"
+_ITEMS = r"(?:exposition(?:en)?|expostion(?:en)?|stelle(?:n)?)"
+_LIST_ANY = r"(?:auflisten|aufz(?:ä|ae)hlen|liste(?:n)?|liste\s+der|lister)"
+_DOCUMENT_HINTS = r"(?:im\s+dokument|dokument|pdf|datei)"
+
 
 _SPECIAL_PATTERNS = [
-    # “alle Expositionen …”
+    # a) very broad “alle … Exposition(en) …”
     re.compile(rf"\b{_ALL}.*{_EXPO}\b.*(?:{_LIST_VERBS})?", re.I),
     re.compile(rf"\b(?:{_LIST_VERBS}).*{_ALL}.*{_EXPO}\b", re.I),
-    # “alle farblich markierten Expositionen/Arbeitsbereiche/Tätigkeiten …”
+
+    # b) “alle farblich markierten …”
     re.compile(rf"\b{_ALL}.*{_COLOR}.*(?:{_EXPO}|{_AREAS})\b.*(?:{_LIST_VERBS})?", re.I),
     re.compile(rf"\b(?:{_LIST_VERBS}).*{_ALL}.*{_COLOR}.*(?:{_EXPO}|{_AREAS})\b", re.I),
-    # “alle Auffälligkeiten / auffälligen Expositionen …”
+
+    # c) “alle Auffälligkeiten …”
     re.compile(rf"\b{_ALL}.*{_AUFF}\b.*(?:{_LIST_VERBS})?", re.I),
     re.compile(rf"\b(?:{_LIST_VERBS}).*{_ALL}.*{_AUFF}\b", re.I),
+
+    # d) color-scoped lists, with or without “alle”
+    re.compile(rf"\b(?:{_LIST_VERBS}).*\b{_COLOR_WORDS}\b.*\b{_ITEMS}\b", re.I),
+    re.compile(rf"\b{_COLOR_WORDS}\b.*\b{_ITEMS}\b.*(?:{_LIST_VERBS})?", re.I),
+
+    # e) “im Bereich …” scoped lists of Expositionen
+    re.compile(rf"\b(?:{_LIST_VERBS}).*\b{_EXPO}\b.*\b{_ROOM_HINTS}\b", re.I),
+    re.compile(rf"\b{_EXPO}\b.*\b{_ROOM_HINTS}\b.*(?:{_LIST_VERBS})?", re.I),
+
+    # f) “im Dokument” / PDF-scoped lists
+    re.compile(rf"\b(?:{_LIST_VERBS})\b.*\b{_ITEMS}\b.*\b{_DOCUMENT_HINTS}\b", re.I),
+    re.compile(rf"\b{_ITEMS}\b.*\b{_DOCUMENT_HINTS}\b.*(?:{_LIST_VERBS})?", re.I),
+
+    # g) Room/area scopes (unchanged logic, but use _ITEMS to also cover “Stellen”)
+    re.compile(rf"\b(?:{_LIST_VERBS}).*\b{_ITEMS}\b.*\b{_ROOM_HINTS}\b", re.I),
+    re.compile(rf"\b{_ITEMS}\b.*\b{_ROOM_HINTS}\b.*(?:{_LIST_VERBS})?", re.I),
+
+    # h) split-verb forms like “listen ... auf” (with optional “Sie”)
+    re.compile(rf"\blisten(?:\s+sie)?\b.*\b{_COLOR_WORDS}\b.*\b{_ITEMS}\b.*\bauf\b", re.I),
+    re.compile(rf"\blisten(?:\s+sie)?\b.*\b{_ITEMS}\b.*\bauf\b", re.I),
+
+    # i) "Gib/Gebe mir eine Liste ..." style requests (list-style)
+    re.compile(r"\b(?:gib|gebe)\s+(?:mir|uns)?\s+(?:eine\s+)?liste\b.*\b{_ITEMS}\b", re.I),
+    re.compile(r"\b(?:gib|gebe)\s+(?:mir|uns)?\s+(?:eine\s+)?liste\b.*\bexposition", re.I),
+    re.compile(r"\bliste\s+der\b.*\bexposition", re.I),
+
+    # j) modal/indirect forms like “ob du … auflisten kannst / kannst du … auflisten …”
+    re.compile(rf"\b(?:ob\s+)?(?:kann|kannst|können|koennen|würde|wuerde|würdest|wuerdest)\b.*\b{_ITEMS}\b.*\b(?:auflisten|aufzaehlen|aufzählen)\b", re.I),
+    re.compile(rf"\b(?:ob\s+)?(?:kann|kannst|können|koennen|würde|wuerde|würdest|wuerdest)\b.*\b(?:auflisten|aufzaehlen|aufzählen)\b.*\b{_ITEMS}\b", re.I),
+
+    # broad, order-agnostic “list … items” catch-alls
+    re.compile(rf"\b{_LIST_ANY}\b.*\b{_ITEMS}\b", re.I),
+    re.compile(rf"\b{_ITEMS}\b.*\b{_LIST_ANY}\b", re.I),
+
+    # “Gib/Gebe mir eine Liste/Lister …” noun-phrase style
+    re.compile(rf"\b(?:gib|gebe)\s+(?:mir|uns)?\s+(?:eine\s+)?(?:liste|lister)\b.*\b{_ITEMS}\b", re.I),
+
+    # modal/indirect forms (“ob du … auflisten kannst / kannst du … auflisten …”)
+    re.compile(
+        rf"\b(?:ob\s+)?(?:kann|kannst|können|koennen|würde|wuerde|würdest|wuerdest)\b"
+        rf".*\b{_ITEMS}\b.*\b(?:auflisten|aufz(?:ä|ae)hlen)\b",
+        re.I
+    ),
+
+
 ]
+
 
 def _is_blocked_list_request(raw_q: str) -> bool:
     q = (raw_q or "").strip().lower()
-    # strip any short “prefix: …” users might type
-    q = re.sub(r"^[^:]{1,40}:\s*", "", q)
+    q = re.sub(r"^[^:]{1,40}:\s*", "", q)  # keep your existing prefix trim
+
     return any(p.search(q) for p in _SPECIAL_PATTERNS)
 
 def _apply_session_context(raw_q: str, st: SessionState) -> str:

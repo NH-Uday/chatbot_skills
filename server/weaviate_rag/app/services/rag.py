@@ -704,9 +704,9 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
 
     # If glossary intent but we couldn't detect a term → ask politely
     if explicit_glossary and not term_for_glossary:
-        return ("Welche Abkürzung meinst du genau?\n"
+        return ("Welche Abkürzung meinst du genau? Bitte fragen Sie so\n"
                 "Beispiele:\n"
-                "- Abkürzung KSS\n"
+                "- Abkürzung CFO\n"
                 "- Was bedeutet KSS?\n"
                 "- Wofür steht LärmVibrationsArbSchV?")
 
