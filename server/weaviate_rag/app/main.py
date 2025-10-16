@@ -75,6 +75,10 @@ _AUFF = r"(?:auffälligkeit(?:en)?|auffaelligkeit(?:en)?|auffällige\s+expositio
 _ITEMS = r"(?:exposition(?:en)?|expostion(?:en)?|stelle(?:n)?)"
 _LIST_ANY = r"(?:auflisten|aufz(?:ä|ae)hlen|liste(?:n)?|liste\s+der|lister)"
 _DOCUMENT_HINTS = r"(?:im\s+dokument|dokument|pdf|datei)"
+_COUNT_HINT = r"(?:wie\s+viel(?:e)?|anzahl|gesamt(?:zahl)?|insgesamt)"
+_SCOPE_TERM = r"(?:text|dokument|pdf|datei)"
+_EXPO_TERM  = r"(?:exposition(?:en)?|expostion(?:en)?|stelle(?:n)?)"
+
 
 
 _SPECIAL_PATTERNS = [
@@ -133,15 +137,26 @@ _SPECIAL_PATTERNS = [
         re.I
     ),
 
+    # Must contain a count hint AND an exposure term (any order)
+    re.compile(rf"(?s)(?=.*\b{_COUNT_HINT}\b)(?=.*\b{_EXPO_TERM}\b)"),
+    # Count + exposure + scope (text/document/file) in any order
+    re.compile(rf"(?s)(?=.*\b{_COUNT_HINT}\b)(?=.*\b{_EXPO_TERM}\b)(?=.*\b{_SCOPE_TERM}\b)"),
+    # Specific “Anzahl der Expositionen …” phrasing
+    re.compile(rf"\banzahl\s+der\s+{_EXPO_TERM}\b"),
+
 
 ]
 
 
 def _is_blocked_list_request(raw_q: str) -> bool:
     q = (raw_q or "").strip().lower()
-    q = re.sub(r"^[^:]{1,40}:\s*", "", q)  # keep your existing prefix trim
+    q = re.sub(r"^[^:]{1,40}:\s*", "", q)  
 
     return any(p.search(q) for p in _SPECIAL_PATTERNS)
+
+def should_block_exposure_count(user_text: str) -> bool:
+    t = _normalize_text(user_text)
+    return any(p.search(t) for p in _BLOCKERS)
 
 def _apply_session_context(raw_q: str, st: SessionState) -> str:
     q = raw_q.strip()
@@ -317,6 +332,12 @@ async def chat(req: ChatRequest):
 # Dedicated endpoints
 @app.post("/chat/fb1")
 async def chat_fb1(req: ChatRequest):
+
+    ser_message = req.message.strip()
+
+    if should_block_exposure_count(user_message):
+        return {"answer": SPECIAL_LIST_REPLY}
+
     if _is_blocked_list_request(req.question):
         return {"answer": SPECIAL_LIST_REPLY}
 
@@ -332,6 +353,7 @@ async def chat_fb1(req: ChatRequest):
 
 @app.post("/chat/fb2")
 async def chat_fb2(req: ChatRequest):
+    
     if _is_blocked_list_request(req.question):
         return {"answer": SPECIAL_LIST_REPLY}
 
