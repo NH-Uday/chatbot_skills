@@ -43,7 +43,8 @@ SYSTEM_PROMPT = (
     "'Das ist im Dokument nicht angegeben.' "
     "Antworte kurz und auf Deutsch."
     "Hinweis: Behandle im Kontext der Fertigung **Feinstaub/Staub/Nebel** als **Aerosole**; "
-    "im Dokument heißen sie oft **KSS-Aerosole**."
+    "im Dokument heißen sie oft **KSS-Aerosole**. "
+    "**Wenn nach Überschreitung/Einhalten von Grenzwerten gefragt wird, nenne nur die Messwerte aus dem Kontext und gib keine Bewertung gegenüber Grenzwerten.**"
 )
 
 # ---------------------------
@@ -249,7 +250,7 @@ def _extract_numeric_spans(text: str) -> List[Dict]:
 def _span_distance(ans: Dict, src: Dict) -> float:
     if ans["unit"] != src["unit"]:
         return 1e6
-    if _norm_ws(_norm_dash(ans["match"])) == _norm_ws(_norm_dash(src["match"])):
+    if _norm_ws(_norm_dash(ans["match"])) == _norm_ws(_norm_dash(src["match"])):  # exact form match
         return 0.0
     a1, b1 = ans["a"], ans["b"]
     a2, b2 = src["a"], src["b"]
@@ -449,7 +450,7 @@ def _gather_candidates(coll, queries: list[str]) -> list:
     for q in queries:
         # vector
         qvec = _embed(q)
-        vec = _vector_search(coll, qvec, k=CANDIDATES_PER_QUERY)
+        vec = _vector_search(coll, k=CANDIDATES_PER_QUERY, query_vec=qvec)
         if vec:
             for o in vec.objects:
                 bag[o.uuid] = o
@@ -489,6 +490,28 @@ def _scrub_artifacts(s: str) -> str:
     s = re.sub(r"\(\s*cid\s*:\s*\d+\s*\)", "", s, flags=re.I)
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()
+
+# --- Limit-comparison detection (DE/EN patterns) -----------------------------
+
+_LIMIT_Q_PATTERNS = [
+    re.compile(r"\b(grenzwert|auslösewert|ausloesewert|arbeitsplatzgrenzwert|agw)\b.*\b(über|ueber|unter|einhalten|eingehalten|überschritten|ueberschritten)\b", re.I),
+    re.compile(r"\b(überschreitet|ueberschreitet|überschritten|ueberschritten|einhalten|eingehalten|unterschritten)\b.*\b(grenzwert|agw|auslösewert|ausloesewert)\b", re.I),
+    re.compile(r"\b(exceed|exceeds|exceeded|below|under|within)\b.*\b(limit|threshold|tlv|pel)\b", re.I),
+    re.compile(r"\b(limit|threshold|tlv|pel)\b.*\b(exceed|exceeds|exceeded|below|under|within)\b", re.I),
+]
+
+def _is_limit_comparison_question(q: str) -> bool:
+    s = (q or "").lower()
+    return any(rx.search(s) for rx in _LIMIT_Q_PATTERNS)
+
+_LIMIT_VERDICT_WORDS = re.compile(
+    r"\b(überschritten|ueberschritten|eingehalten|unterschritten|exceeds?|below|under|within\s+limit[s]?)\b",
+    re.I
+)
+
+def _strip_limit_verdicts(text: str) -> str:
+    # Remove verdict-y words but keep numbers/units/quotes
+    return _LIMIT_VERDICT_WORDS.sub("", text).strip()
 
 # (Left as-is; not used by the main pipeline. Keep for compatibility.)
 def vector_search(q):
@@ -940,10 +963,21 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
                 "\n\n[Hinweis] In diesem Dokument werden Feinstaub/Staub/Nebel als Aerosole geführt, "
                 "meist als KSS-Aerosole."
             )
-        
+
+        # NEW: guard instruction if user asks "exceeds limit?"
+        limit_compare = _is_limit_comparison_question(question)
+        guard = ""
+        if limit_compare:
+            guard = (
+                "\n\n[Anweisung – wichtig] Der Nutzer fragt nach Grenzwert-Überschreitung. "
+                "Antworte in diesem Fall NUR mit den im Kontext genannten Messwerten "
+                "(Zahlen + Einheiten + kurzer Messkontext) und gib KEIN Urteil darüber ab, "
+                "ob Grenzwerte überschritten, eingehalten oder unterschritten werden."
+            )
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Frage: {question}{domain_hint}\n\nKontext:\n{context}"},
+            {"role": "user", "content": f"Frage: {question}{domain_hint}{guard}\n\nKontext:\n{context}"},
         ]
 
         resp = oa.chat.completions.create(
@@ -953,13 +987,27 @@ def retrieve_answer(question: str, target: Optional[str] = None) -> str:
         )
         draft = (resp.choices[0].message.content or "").strip()
 
-        if re.search(r"\bstarkstrom\b", question, re.I) and re.search(r"\b(400\s*V|63\s*A)\b", context, re.I):
+        # Keep the Starkstrom nudge only if not a limit-comparison Q
+        if (not limit_compare) and re.search(r"\bstarkstrom\b", question, re.I) and re.search(r"\b(400\s*V|63\s*A)\b", context, re.I):
             if "nicht angegeben" in draft.lower():
                 draft = "Ja – offen 400 V/63 A."
 
         sources_concat = "\n".join(c["text"] for c in chunks)
         final = _numeric_guard(draft, sources_concat)
         final = _scrub_artifacts(final)
+
+        # NEW: strip any verdict language for limit questions
+        if limit_compare:
+            final = _strip_limit_verdicts(final)
+            if len(final) < 5:
+                spans = _extract_numeric_spans(sources_concat)
+                if spans:
+                    units_ok = {"mg/m³","mg/m3","µg/m³","ug/m3","dB(A)","dB","m/s²","%","lx","°C"}
+                    pick = next((s for s in spans if _norm_unit(s.get("unit")) in units_ok), None)
+                    if pick:
+                        final = f"Im Dokument genannte Messwerte: {pick['match']}."
+                if len(final) < 5:
+                    final = "Im Dokument sind Messwerte genannt; eine Bewertung gegenüber Grenzwerten wird nicht vorgenommen."
 
         seen = set()
         unique = []
@@ -1141,10 +1189,21 @@ def retrieve_answer_with_meta(question: str, target: Optional[str] = None) -> Tu
             "\n\n[Hinweis] In diesem Dokument werden Feinstaub/Staub/Nebel als Aerosole geführt, "
             "meist als KSS-Aerosole."
         )
+
+    # NEW: guard instruction if user asks "exceeds limit?"
+    limit_compare = _is_limit_comparison_question(question)
+    guard = ""
+    if limit_compare:
+        guard = (
+            "\n\n[Anweisung – wichtig] Der Nutzer fragt nach Grenzwert-Überschreitung. "
+            "Antworte in diesem Fall NUR mit den im Kontext genannten Messwerten "
+            "(Zahlen + Einheiten + kurzer Messkontext) und gib KEIN Urteil darüber ab, "
+            "ob Grenzwerte überschritten, eingehalten oder unterschritten werden."
+        )
     
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Frage: {question}{domain_hint}\n\nKontext:\n{context}"},
+        {"role": "user", "content": f"Frage: {question}{domain_hint}{guard}\n\nKontext:\n{context}"},
     ]
     resp = oa.chat.completions.create(
         model=OPENAI_MODEL,
@@ -1153,13 +1212,27 @@ def retrieve_answer_with_meta(question: str, target: Optional[str] = None) -> Tu
     )
     draft = (resp.choices[0].message.content or "").strip()
 
-    if re.search(r"\bstarkstrom\b", question, re.I) and re.search(r"\b(400\s*V|63\s*A)\b", context, re.I):
+    # Keep Starkstrom nudge only if not a limit question
+    if (not limit_compare) and re.search(r"\bstarkstrom\b", question, re.I) and re.search(r"\b(400\s*V|63\s*A)\b", context, re.I):
         if "nicht angegeben" in draft.lower():
             draft = "Ja – offen 400 V/63 A."
 
     sources_concat = "\n".join(c["text"] for c in chunks)
     final = _numeric_guard(draft, sources_concat)
     final = _scrub_artifacts(final)
+
+    # NEW: Remove any verdict language if it's a limit comparison question
+    if limit_compare:
+        final = _strip_limit_verdicts(final)
+        if len(final) < 5:
+            spans = _extract_numeric_spans(sources_concat)
+            if spans:
+                units_ok = {"mg/m³","mg/m3","µg/m³","ug/m3","dB(A)","dB","m/s²","%","lx","°C"}
+                pick = next((s for s in spans if _norm_unit(s.get("unit")) in units_ok), None)
+                if pick:
+                    final = f"Im Dokument genannte Messwerte: {pick['match']}."
+            if len(final) < 5:
+                final = "Im Dokument sind Messwerte genannt; eine Bewertung gegenüber Grenzwerten wird nicht vorgenommen."
 
     seen = set(); unique = []
     for c in chunks:
