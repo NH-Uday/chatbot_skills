@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from app.services.admin_log import log_exchange
 
 from app.services.rag import retrieve_answer_with_meta
 from app.services.weaviate_setup import (
@@ -14,6 +15,11 @@ from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 import time
 import re
+from fastapi.responses import JSONResponse
+import json
+import io
+import weaviate as wv
+from app.services.weaviate_setup import client, CHATLOG_CLASS
 
 
 SESSION_TTL_SECONDS = 60 * 60  # 1 hour
@@ -406,6 +412,29 @@ def _handle_exceedance_flow(req: ChatRequest, st: SessionState, target: Optional
     # Not an exceedance flow case
     return None
 
+def _answer_and_update(req: ChatRequest, target: str | None, st: SessionState):
+    augmented = _apply_session_context(req.question, st)
+    answer, meta_room, meta_machine = retrieve_answer_with_meta(augmented, target=target)
+
+    if meta_room:
+        st.last_room = meta_room
+    if meta_machine:
+        st.last_machine = meta_machine
+
+    _update_session_from_question_and_answer(req.question, answer, st)
+
+    # ✅ Log every Q&A pair (session-level)
+    try:
+        log_exchange(
+            session_id=req.session_id or "default",
+            bot_key=target or req.target or "",
+            question=req.question,
+            answer=answer or "",
+        )
+    except Exception:
+        pass
+
+    return answer
 
 # ------------------------------
 # Endpoints
@@ -516,6 +545,52 @@ async def reset_session(session_id: str | None = Query(None, description="sessio
     sid = session_id or "default"
     SESSIONS.pop(sid, None)
     return {"ok": True}
+
+@app.get("/admin/logs")
+async def admin_logs(season: str | None = None, limit: int = 100):
+    import weaviate as wv
+    from app.services.weaviate_setup import client, CHATLOG_CLASS
+
+    coll = client.collections.get(CHATLOG_CLASS)
+    flt = None
+    if season:
+        flt = wv.classes.query.Filter.by_property("season").equal(season)
+
+    res = coll.query.fetch_objects(
+        limit=min(limit, 1000),
+        filters=flt,
+        return_properties=["session_id", "season", "ts", "bot_key", "question", "answer"]
+    )
+    return {
+        "logs": [o.properties for o in getattr(res, "objects", []) or []]
+    }
+
+@app.get("/admin/logs/export")
+async def export_logs_json(season: str | None = None, limit: int = 2000):
+    
+    coll = client.collections.get(CHATLOG_CLASS)
+    flt = None
+    if season:
+        flt = wv.classes.query.Filter.by_property("season").equal(season)
+
+    res = coll.query.fetch_objects(
+        limit=min(limit, 5000),
+        filters=flt,
+        return_properties=["session_id", "season", "ts", "bot_key", "question", "answer"]
+    )
+
+    logs = [o.properties for o in getattr(res, "objects", []) or []]
+
+    # Generate downloadable JSON file
+    json_bytes = json.dumps(logs, indent=2, ensure_ascii=False).encode("utf-8")
+    filename = f"chatlogs_{season or 'all'}.json"
+    return JSONResponse(
+        content=json.loads(json_bytes.decode("utf-8")),
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Content-Type": "application/json; charset=utf-8"
+        },
+    )
 
 
 # ------------------------------

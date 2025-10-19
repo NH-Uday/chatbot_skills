@@ -152,8 +152,9 @@ def ensure_collections() -> None:
     """Ensure all three isolated collections (FB1/FB2/FB3) exist, plus the glossary."""
     for name in CLASS_NAMES:
         _create_collection_if_missing(name)
-    _create_glossary_if_missing()  # <-- ensure glossary exists too
-
+    _create_glossary_if_missing()  
+    _create_chatlog_if_missing()
+    
 def get_collection(name: str):
     """Return a collection by exact class name (ensuring it exists)."""
     ensure_collections()
@@ -196,3 +197,27 @@ def init_schema() -> None:
 
 # Legacy default; not used by multi-bot path but keeps old imports happy.
 CLASS_NAME = os.getenv("WEAVIATE_CLASS", "LectureChunk")
+
+
+# --- NEW: ChatLog class for admin-only chat history ---
+CHATLOG_CLASS = (os.getenv("WEAVIATE_CLASS_CHATLOG") or "ChatLog").strip()
+
+def _create_chatlog_if_missing() -> None:
+    existing = _list_collection_names()
+    if CHATLOG_CLASS in existing:
+        return
+    client.collections.create(
+        name=CHATLOG_CLASS,
+        properties=[
+            Property(name="session_id",  data_type=DataType.TEXT),
+            Property(name="season",      data_type=DataType.TEXT),  # e.g. 2025-Q4
+            Property(name="ts",          data_type=DataType.INT),   # timestamp
+            Property(name="bot_key",     data_type=DataType.TEXT),  # FB1 | FB2 | FB3
+            Property(name="question",    data_type=DataType.TEXT),
+            Property(name="answer",      data_type=DataType.TEXT),
+        ],
+        vectorizer_config=Configure.Vectorizer.none(),
+        vector_index_config=_vector_index_config(),
+        description="Admin-only chat history grouped by season for analytics",
+    )
+    print(f"✅ Created schema for '{CHATLOG_CLASS}'")
