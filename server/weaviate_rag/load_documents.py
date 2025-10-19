@@ -33,6 +33,10 @@ BOT_KEYS = ["FB1", "FB2", "FB3"]
 # Toggle the new hi-res extraction path (default ON)
 USE_HIRES = os.getenv("USE_HIRES_EXTRACTION", "1") not in ("0", "false", "False")
 
+# Tunable chunking (bigger chunks + more overlap improve recall for metric + context in one chunk)
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "250"))
+
 # ------------------------ PDF text extraction (legacy, page-wise) ------------------------
 
 def _read_pdf_pages(pdf_path: Path) -> List[str]:
@@ -117,16 +121,21 @@ def _blocks_to_spans(blocks) -> List[Dict[str, Optional[str]]]:
     return spans
 
 def _clean_text(s: str) -> str:
-    # Remove common cid garbage and normalize spaces/dashes/superscripts
-    s = re.sub(r"\(\s*cid\s*:\s*\d+\s*\)", "", s, flags=re.I)
+    """
+    Remove common artifacts and normalize whitespace/dashes.
+    IMPORTANT: Keep scientific units as written (e.g., 'mg/m³'); do NOT convert to 'mg/m3'.
+    """
+    s = re.sub(r"\(\s*cid\s*:\s*\d+\s*\)", "", s, flags=re.I)  # remove (cid:123)
+    # normalize dashes and spaces
     s = s.replace("\u2013", "-").replace("\u2212", "-").replace("\u00A0", " ")
-    s = s.replace("m³", "m3")
-    return re.sub(r"[ \t]+", " ", s).strip()
+    # keep 'm³' intact; do not down-convert to 'm3'
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
 
 def _chunk_spans(
     spans: List[Dict[str, Optional[str]]],
-    max_len: int = 1000,
-    overlap: int = 150,
+    max_len: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
 ) -> List[Dict[str, Optional[str]]]:
     """
     Simple length-based chunking across spans, preserving approximate page locality.
@@ -155,7 +164,7 @@ def _chunk_spans(
         else:
             # flush current
             flush()
-            # start new with overlap from previous
+            # start new with overlap from previous (take tail of previous content)
             tail = (buf[-overlap:] if buf else "")
             buf = (tail + candidate) if tail else candidate
             first_page = sp.get("page")
@@ -163,23 +172,39 @@ def _chunk_spans(
     flush()
     return [c for c in chunks if c.get("text")]
 
+# --------- Robust detection of room & machine (used for ingestion-time tagging) ----------
+
+_ROOM_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("Endmontage & Prüfstand", re.compile(r"\b(endmontage|prüfstand|pruefstand)\b", re.I)),
+    ("Werkzeug- & Schleifraum", re.compile(r"\b(werkzeug.*schleif|werkzeug-?\s*&\s*schleif|schleifraum|werkzeugraum)\b", re.I)),
+    ("CNC-Fräserei", re.compile(r"\b(cnc[-\s]*fräse|cnc[-\s]*fraese|cnc[-\s]*fräserei|cnc[-\s]*fraeserei|cnc)\b", re.I)),
+    ("Elektro / Schaltschrank", re.compile(r"\b(schaltschrank|loto|starkstrom|400\s*v|63\s*a)\b", re.I)),
+]
+
+_MACHINE_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("Schleifen/Handschleifer", re.compile(r"\b(handschleifer|schleif(gerät|geraet)|schleifen/hand)\b", re.I)),
+    ("CNC-Bearbeitungszentrum", re.compile(r"\b(cnc[-\s]*bearbeitungszentrum|bearbeitungszentrum|fräszentrum|fraeszentrum)\b", re.I)),
+    ("Schaltschrank/LOTO", re.compile(r"\b(schaltschrank|loto)\b", re.I)),
+    ("Schrumpfgerät", re.compile(r"\b(schrumpf(gerät|geraet))\b", re.I)),
+    ("Prüfstand", re.compile(r"\b(prüfstand|pruefstand)\b", re.I)),  # sometimes treated like a station/machine
+    ("Spannvorrichtung", re.compile(r"\b(spannvorrichtung)\b", re.I)),
+]
+
 def _detect_room(text: str) -> Optional[str]:
-    # Heuristic keywords; expand as you like
-    t = text.lower()
-    if "cnc-fräserei" in t or "cnc fräserei" in t or "cnc-fraeserei" in t or "cnc fraeserei" in t:
-        return "CNC-Fräserei"
-    if "werkzeug" in t and "schleif" in t:
+    t = text or ""
+    for label, rx in _ROOM_PATTERNS:
+        if rx.search(t):
+            return label
+    # special combined phrase
+    if re.search(r"werkzeug", t, re.I) and re.search(r"schleif", t, re.I):
         return "Werkzeug- & Schleifraum"
-    if "elektro" in t or "schaltschrank" in t:
-        return "Elektro / Schaltschrank"
     return None
 
 def _detect_machine(text: str) -> Optional[str]:
-    t = text.lower()
-    if "handschleifer" in t:
-        return "Handschleifer"
-    if "bearbeitungszentrum" in t or "fräszentrum" in t or "fraeszentrum" in t:
-        return "Bearbeitungszentrum"
+    t = text or ""
+    for label, rx in _MACHINE_PATTERNS:
+        if rx.search(t):
+            return label
     return None
 
 def _ingest_hires_chunks(pdf_path: Path, class_name: str) -> int:
@@ -191,7 +216,7 @@ def _ingest_hires_chunks(pdf_path: Path, class_name: str) -> int:
     print(f"🔎 hi-res extracting: {pdf_path.name}")
     blocks = _extract_blocks_hires(pdf_path)
     spans = _blocks_to_spans(blocks)
-    chunks = _chunk_spans(spans, max_len=1000, overlap=150)
+    chunks = _chunk_spans(spans, max_len=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
     if not chunks:
         print("ℹ️ hi-res produced no chunks; skipping.")
         return 0
@@ -201,12 +226,14 @@ def _ingest_hires_chunks(pdf_path: Path, class_name: str) -> int:
     for ch in chunks:
         text = ch["text"] or ""
         page = int(ch["page"]) if ch.get("page") else 1
+        room = _detect_room(text) or ""
+        machine = _detect_machine(text) or ""
         props = {
             "text": text,
             "source": pdf_path.name,
             "page": page,
-            "room": _detect_room(text) or "",
-            "machine": _detect_machine(text) or "",
+            "room": room,
+            "machine": machine,
         }
         try:
             coll.data.insert(properties=props)
@@ -451,3 +478,5 @@ if __name__ == "__main__":
 # python load_documents.py "docs/2025-08-18_FB 1 NEU.pdf" FB1
 # Toggle new path off if needed:
 # USE_HIRES_EXTRACTION=0 python load_documents.py "docs/2025-08-18_FB 1 NEU.pdf" FB1
+# Optional tunings:
+# CHUNK_SIZE=1400 CHUNK_OVERLAP=300 python load_documents.py "docs/2025-08-18_FB 1 NEU.pdf" FB1

@@ -15,9 +15,6 @@ from dataclasses import dataclass, field
 import time
 import re
 
-# ------------------------------
-# Session & constants
-# ------------------------------
 
 SESSION_TTL_SECONDS = 60 * 60  # 1 hour
 
