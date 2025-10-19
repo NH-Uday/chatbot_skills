@@ -15,7 +15,12 @@ from dataclasses import dataclass, field
 import time
 import re
 
-SESSION_TTL_SECONDS = 60 * 60  
+# ------------------------------
+# Session & constants
+# ------------------------------
+
+SESSION_TTL_SECONDS = 60 * 60  # 1 hour
+
 
 @dataclass
 class SessionState:
@@ -26,8 +31,12 @@ class SessionState:
     touched_at: float = field(default_factory=lambda: time.time())
     pending_glossary_term: Optional[str] = None
     last_glossary_term: Optional[str] = None
+    # NEW: waiting for working activity before answering exceedance question
+    pending_exceedance_activity: bool = False
+
 
 SESSIONS: Dict[str, SessionState] = {}
+
 
 def _get_state(session_id: str) -> SessionState:
     now = time.time()
@@ -42,6 +51,7 @@ def _get_state(session_id: str) -> SessionState:
             SESSIONS.pop(sid, None)
     return st
 
+
 # Try to import fine-grained detectors from rag; fall back gracefully if absent
 try:
     from app.services.rag import detect_room_from_question, pick_machine_from_question  # type: ignore
@@ -49,13 +59,19 @@ except Exception:
     def detect_room_from_question(_q: str) -> Optional[str]: return None  # type: ignore
     def pick_machine_from_question(_q: str) -> Optional[str]: return None  # type: ignore
 
+
 def _detect_noise_kind(q: str) -> Optional[str]:
     ql = q.lower()
-    if any(k in ql for k in ["laeq", "leq", "durchschnitt", "average"]): return "laeq"
-    if any(k in ql for k in ["peak", "lafmax", "spitze", "spitzenwert", "maximal"]): return "peak"
-    if any(k in ql for k in ["grenzwert", "expositionsgrenzwert", "am ohr", "ohr"]): return "limit"
-    if any(k in ql for k in ["raum", "raumpegel", "im raum", "hintergrundpegel"]): return "room"
+    if any(k in ql for k in ["laeq", "leq", "durchschnitt", "average"]):
+        return "laeq"
+    if any(k in ql for k in ["peak", "lafmax", "spitze", "spitzenwert", "maximal"]):
+        return "peak"
+    if any(k in ql for k in ["grenzwert", "expositionsgrenzwert", "am ohr", "ohr"]):
+        return "limit"
+    if any(k in ql for k in ["raum", "raumpegel", "im raum", "hintergrundpegel"]):
+        return "room"
     return None
+
 
 # --- Special-case list-request blocker --------------------------------------
 SPECIAL_LIST_REPLY = (
@@ -70,14 +86,26 @@ _EXPO = r"(?:exposition(?:en)?)"
 _COLOR = r"(?:farblich\s+markiert(?:e|en)?)"
 _COLOR_WORDS = r"(?:rot(?:e|en)?|gelb(?:e|en)?|gr[üu]n(?:e|en)?)"
 _AREAS = r"(?:arbeitsbereich(?:e)?|tätigkeit(?:en)?|taetigkeit(?:en)?)"
-_ROOM_HINTS  = r"(?:im\s+bereich|bereich|raum|cnc|fr[äa]serei|fraeserei|werkzeug|schleif|montage|pr[üu]fstand|pruefstand)"
+_ROOM_HINTS = r"(?:im\s+bereich|bereich|raum|cnc|fr[äa]serei|fraeserei|werkzeug|schleif|montage|pr[üu]fstand|pruefstand)"
 _AUFF = r"(?:auffälligkeit(?:en)?|auffaelligkeit(?:en)?|auffällige\s+exposition(?:en)?|auffaellige\s+exposition(?:en)?)"
 _ITEMS = r"(?:exposition(?:en)?|expostion(?:en)?|stelle(?:n)?)"
 _LIST_ANY = r"(?:auflisten|aufz(?:ä|ae)hlen|liste(?:n)?|liste\s+der|lister)"
 _DOCUMENT_HINTS = r"(?:im\s+dokument|dokument|pdf|datei)"
 _COUNT_HINT = r"(?:wie\s+viel(?:e)?|anzahl|gesamt(?:zahl)?|insgesamt)"
 _SCOPE_TERM = r"(?:text|dokument|pdf|datei)"
-_EXPO_TERM  = r"(?:exposition(?:en)?|expostion(?:en)?|stelle(?:n)?)"
+_EXPO_TERM = r"(?:exposition(?:en)?|expostion(?:en)?|stelle(?:n)?)"
+# Words signalling limit concepts
+_LIMIT_TERMS = r"(?:grenz(?:\s*|-|/)?wert|ausl(?:ö|oe)se(?:\s*|-|/)?wert|ausl(?:ö|oe)se(?:\s*|-|/)?schwelle|schwellen(?:\s*|-|/)?wert|agw|bgw|oel|oelv|gw)"
+# Words signalling exceedance/compliance questions
+_CHECK_TERMS = r"(?:ueberschreit|überschreit|ueber|über|exceed|einhalten|eingehalten|ob\b)"
+
+# Accept messy punctuation/hyphenation between words (e.g., "Grenz-, Auslöse-")
+_SEP = r"[\s,;:/\-]*"
+
+_EXCEEDANCE_RX = re.compile(
+    rf"(?s)(?:{_CHECK_TERMS}).*{_SEP}(?:{_LIMIT_TERMS})|(?:{_LIMIT_TERMS}).*{_SEP}(?:{_CHECK_TERMS})",
+    re.I,
+)
 
 
 
@@ -106,7 +134,7 @@ _SPECIAL_PATTERNS = [
     re.compile(rf"\b(?:{_LIST_VERBS})\b.*\b{_ITEMS}\b.*\b{_DOCUMENT_HINTS}\b", re.I),
     re.compile(rf"\b{_ITEMS}\b.*\b{_DOCUMENT_HINTS}\b.*(?:{_LIST_VERBS})?", re.I),
 
-    # g) Room/area scopes (unchanged logic, but use _ITEMS to also cover “Stellen”)
+    # g) Room/area scopes
     re.compile(rf"\b(?:{_LIST_VERBS}).*\b{_ITEMS}\b.*\b{_ROOM_HINTS}\b", re.I),
     re.compile(rf"\b{_ITEMS}\b.*\b{_ROOM_HINTS}\b.*(?:{_LIST_VERBS})?", re.I),
 
@@ -114,28 +142,27 @@ _SPECIAL_PATTERNS = [
     re.compile(rf"\blisten(?:\s+sie)?\b.*\b{_COLOR_WORDS}\b.*\b{_ITEMS}\b.*\bauf\b", re.I),
     re.compile(rf"\blisten(?:\s+sie)?\b.*\b{_ITEMS}\b.*\bauf\b", re.I),
 
-    # i) "Gib/Gebe mir eine Liste ..." style requests (list-style)
-    re.compile(r"\b(?:gib|gebe)\s+(?:mir|uns)?\s+(?:eine\s+)?liste\b.*\b{_ITEMS}\b", re.I),
+    # i) "Gib/Gebe mir eine Liste ..." style requests
     re.compile(r"\b(?:gib|gebe)\s+(?:mir|uns)?\s+(?:eine\s+)?liste\b.*\bexposition", re.I),
     re.compile(r"\bliste\s+der\b.*\bexposition", re.I),
 
-    # j) modal/indirect forms like “ob du … auflisten kannst / kannst du … auflisten …”
+    # j) modal/indirect forms like “ob du … auflisten kannst”
     re.compile(rf"\b(?:ob\s+)?(?:kann|kannst|können|koennen|würde|wuerde|würdest|wuerdest)\b.*\b{_ITEMS}\b.*\b(?:auflisten|aufzaehlen|aufzählen)\b", re.I),
     re.compile(rf"\b(?:ob\s+)?(?:kann|kannst|können|koennen|würde|wuerde|würdest|wuerdest)\b.*\b(?:auflisten|aufzaehlen|aufzählen)\b.*\b{_ITEMS}\b", re.I),
 
+    # k) narrative or summary-style exposure requests (Fließtext, Zusammenfassung, Beschreibung)
+    re.compile(r"\b(flie(ss|ß)?text|zusammenfassung|beschreibung|darstellung)\b.*\bexposition", re.I),
+    re.compile(r"\b(exposition(?:en)?)\b.*\b(flie(ss|ß)?text|zusammenfassung|beschreibung|darstellung)\b", re.I),
+    re.compile(r"\b(erstell|formulier|schreib|beschreib|fasse)\b.*\bexposition(?:en)?\b", re.I),
+    re.compile(r"\bexposition(?:en)?\b.*\b(grenzwert|werte|zusammenhang|relation)\b", re.I),
+
+    
     # broad, order-agnostic “list … items” catch-alls
     re.compile(rf"\b{_LIST_ANY}\b.*\b{_ITEMS}\b", re.I),
     re.compile(rf"\b{_ITEMS}\b.*\b{_LIST_ANY}\b", re.I),
 
-    # “Gib/Gebe mir eine Liste/Lister …” noun-phrase style
+    # Noun-phrase style
     re.compile(rf"\b(?:gib|gebe)\s+(?:mir|uns)?\s+(?:eine\s+)?(?:liste|lister)\b.*\b{_ITEMS}\b", re.I),
-
-    # modal/indirect forms (“ob du … auflisten kannst / kannst du … auflisten …”)
-    re.compile(
-        rf"\b(?:ob\s+)?(?:kann|kannst|können|koennen|würde|wuerde|würdest|wuerdest)\b"
-        rf".*\b{_ITEMS}\b.*\b(?:auflisten|aufz(?:ä|ae)hlen)\b",
-        re.I
-    ),
 
     # Must contain a count hint AND an exposure term (any order)
     re.compile(rf"(?s)(?=.*\b{_COUNT_HINT}\b)(?=.*\b{_EXPO_TERM}\b)"),
@@ -144,19 +171,34 @@ _SPECIAL_PATTERNS = [
     # Specific “Anzahl der Expositionen …” phrasing
     re.compile(rf"\banzahl\s+der\s+{_EXPO_TERM}\b"),
 
-
+    
 ]
 
 
 def _is_blocked_list_request(raw_q: str) -> bool:
     q = (raw_q or "").strip().lower()
-    q = re.sub(r"^[^:]{1,40}:\s*", "", q)  
-
+    q = re.sub(r"^[^:]{1,40}:\s*", "", q)  # strip a leading "prefix: " if present
     return any(p.search(q) for p in _SPECIAL_PATTERNS)
 
-def should_block_exposure_count(user_text: str) -> bool:
-    t = _normalize_text(user_text)
-    return any(p.search(t) for p in _BLOCKERS)
+
+# --- Exceedance detection ----------------------------------------------------
+
+_EXCEEDANCE_RX = re.compile(
+    r"(überschreit\w*\s+(?:den|die|das)?\s*(?:grenzwert|expositionsgrenzwert|limit)\b"
+    r"|grenzwert\w*\s*(?:über|ueber)\b"
+    r"|exceed\w*\s+limit\w*"
+    r"|agw\s*(?:über|ueber)\b)",
+    re.I,
+)
+
+
+def _is_exceedance_question(q: str) -> bool:
+    """Detects questions about exceedance/compliance of limits, even if hyphenated or split across lines."""
+    return bool(_EXCEEDANCE_RX.search(q or ""))
+
+
+
+# --- Session-aware prompt shaping -------------------------------------------
 
 def _apply_session_context(raw_q: str, st: SessionState) -> str:
     q = raw_q.strip()
@@ -201,6 +243,7 @@ def _apply_session_context(raw_q: str, st: SessionState) -> str:
 
     return (": ".join(prefix) + ": " + q) if prefix else q
 
+
 def _update_session_from_question_and_answer(q: str, a: str | None, st: SessionState):
     room = detect_room_from_question(q)
     mach = pick_machine_from_question(q)
@@ -239,8 +282,9 @@ def _update_session_from_question_and_answer(q: str, a: str | None, st: SessionS
 
 CONFIRM_RX = re.compile(
     r"^\s*ist\s+d(?:as|er|ie)\b.*\bin\s+der\b\s*(?P<room>[^?!.]+)\??\s*$",
-    re.I
+    re.I,
 )
+
 
 def _try_coref_confirmation(raw_q: str, st: SessionState) -> str | None:
     """
@@ -270,6 +314,8 @@ def _try_coref_confirmation(raw_q: str, st: SessionState) -> str | None:
     return None
 
 
+# --- Request/Response plumbing ----------------------------------------------
+
 class ChatRequest(BaseModel):
     question: str
     target: str | None = None
@@ -282,7 +328,8 @@ async def lifespan(app: FastAPI):
     yield
     close_client()
 
-app = FastAPI(title="PDF RAG Chat", version="1.1.0", lifespan=lifespan)
+
+app = FastAPI(title="PDF RAG Chat", version="1.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -291,6 +338,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Helper to call retriever, then update meta-driven session state
 def _answer_and_update(req: ChatRequest, target: str | None, st: SessionState):
@@ -310,6 +358,62 @@ def _answer_and_update(req: ChatRequest, target: str | None, st: SessionState):
 
     return answer
 
+
+# Use your meta-enabled retriever but force a values-only phrasing
+def _answer_values_only_for_activity(activity_text: str, target: str | None, st: SessionState, req: ChatRequest) -> str:
+    
+    narrow_q = (
+        f"{activity_text}: "
+        "Gib mir nur die Expositionswerte wie im Text (wortgleich: Zahlen + Einheit). "
+        "Keine Bewertung, keine Aussagen zu Grenzwerten, keine Einordnung."
+    )
+    tmp_req = ChatRequest(question=narrow_q, target=req.target, session_id=req.session_id)
+    ans = _answer_and_update(tmp_req, target, st)
+    return ans
+
+
+def _handle_exceedance_flow(req: ChatRequest, st: SessionState, target: Optional[str]):
+    """
+    Implements the policy:
+      - If user asks about exceeding limits, first ask them to specify activity.
+      - Once activity is present, answer with values only (no judgment).
+    Works across endpoints; returns dict or None if not handled here.
+    """
+    q = req.question or ""
+
+    # If we’re already waiting for the activity from a prior turn:
+    if st.pending_exceedance_activity:
+        room = detect_room_from_question(q) or st.last_room
+        machine = pick_machine_from_question(q) or st.last_machine
+
+        if not (room or machine):
+            return {"answer": "Zu welcher Tätigkeit/Arbeitsbereich? Beispiele: **CNC-Fräserei**, **Werkzeug- & Schleifraum**, **Endmontage & Prüfstand**."}
+
+        st.pending_exceedance_activity = False
+        activity = room or machine
+        ans = _answer_values_only_for_activity(activity, target, st, req)
+        return {"answer": ans}
+
+    # Fresh detection
+    if _is_exceedance_question(q):
+        room = detect_room_from_question(q)
+        machine = pick_machine_from_question(q)
+        if not (room or machine):
+            st.pending_exceedance_activity = True
+            return {"answer": "Verstanden. **Bitte gib zuerst die Tätigkeit/den Arbeitsbereich an** (z. B. CNC-Fräserei, Werkzeug- & Schleifraum, Endmontage & Prüfstand)."}
+        else:
+            activity = room or machine
+            ans = _answer_values_only_for_activity(activity, target, st, req)
+            return {"answer": ans}
+
+    # Not an exceedance flow case
+    return None
+
+
+# ------------------------------
+# Endpoints
+# ------------------------------
+
 # Generic endpoint (accepts 'target')
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -325,19 +429,19 @@ async def chat(req: ChatRequest):
         _update_session_from_question_and_answer(req.question, coref, st)
         return {"answer": coref}
 
-    # 2) Normal flow
+    # 2) Exceedance flow (activity gate + values-only reply)
+    handled = _handle_exceedance_flow(req, st, req.target)
+    if handled is not None:
+        return handled
+
+    # 3) Normal flow
     answer = _answer_and_update(req, req.target, st)
     return {"answer": answer}
+
 
 # Dedicated endpoints
 @app.post("/chat/fb1")
 async def chat_fb1(req: ChatRequest):
-
-    ser_message = req.message.strip()
-
-    if should_block_exposure_count(user_message):
-        return {"answer": SPECIAL_LIST_REPLY}
-
     if _is_blocked_list_request(req.question):
         return {"answer": SPECIAL_LIST_REPLY}
 
@@ -347,13 +451,18 @@ async def chat_fb1(req: ChatRequest):
     if coref:
         _update_session_from_question_and_answer(req.question, coref, st)
         return {"answer": coref}
+
+    # Exceedance flow for FB1
+    handled = _handle_exceedance_flow(req, st, "FB1")
+    if handled is not None:
+        return handled
 
     answer = _answer_and_update(req, "FB1", st)
     return {"answer": answer}
 
+
 @app.post("/chat/fb2")
 async def chat_fb2(req: ChatRequest):
-    
     if _is_blocked_list_request(req.question):
         return {"answer": SPECIAL_LIST_REPLY}
 
@@ -364,8 +473,14 @@ async def chat_fb2(req: ChatRequest):
         _update_session_from_question_and_answer(req.question, coref, st)
         return {"answer": coref}
 
+    # Exceedance flow for FB2
+    handled = _handle_exceedance_flow(req, st, "FB2")
+    if handled is not None:
+        return handled
+
     answer = _answer_and_update(req, "FB2", st)
     return {"answer": answer}
+
 
 @app.post("/chat/fb3")
 async def chat_fb3(req: ChatRequest):
@@ -379,17 +494,25 @@ async def chat_fb3(req: ChatRequest):
         _update_session_from_question_and_answer(req.question, coref, st)
         return {"answer": coref}
 
+    # Exceedance flow for FB3
+    handled = _handle_exceedance_flow(req, st, "FB3")
+    if handled is not None:
+        return handled
+
     answer = _answer_and_update(req, "FB3", st)
     return {"answer": answer}
+
 
 # Utility
 @app.get("/bots")
 async def list_bots():
     return {"bots": KEY_TO_CLASS}
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 @app.post("/session/reset")
 async def reset_session(session_id: str | None = Query(None, description="session id to reset")):
@@ -398,22 +521,30 @@ async def reset_session(session_id: str | None = Query(None, description="sessio
     return {"ok": True}
 
 
+# ------------------------------
+# Debug helpers
+# ------------------------------
+
 from app.services.rag import _resolve_collection, _vector_search, _bm25_search, _embed
-from weaviate.classes.query import MetadataQuery
+from weaviate.classes.query import MetadataQuery  # noqa: F401 (may be used elsewhere)
+
 
 @app.get("/debug/top")
-async def debug_top(q: str = Query(..., description="question"),
-                    target: str = Query("FB1"),
-                    k: int = Query(8)):
+async def debug_top(
+    q: str = Query(..., description="question"),
+    target: str = Query("FB1"),
+    k: int = Query(8),
+):
     coll = _resolve_collection(target)
     qvec = _embed(q)
 
     vec = _vector_search(coll, qvec, k=k)
-    bm  = _bm25_search(coll, q, k=k)
+    bm = _bm25_search(coll, q, k=k)
 
     def pack(res, kind):
         out = []
-        if not res: return out
+        if not res:
+            return out
         for o in res.objects:
             props = getattr(o, "properties", {}) or {}
             out.append({
