@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import axios from 'axios'
 
 // 🔒 Extend window to support MathJax types
@@ -10,40 +10,29 @@ declare global {
   }
 }
 
-type Message = {
-  role: 'user' | 'assistant'
-  content: string
-}
-
+type Message = { role: 'user' | 'assistant'; content: string }
 type BotKey = 'FB1' | 'FB2' | 'FB3'
 
 export default function ChatPage() {
-  // --- All hooks must be declared in the same order on every render ---
+  // --- hooks/state ---
   const [mounted, setMounted] = useState(false)
-
-  // Chat/UI state
   const [input, setInput] = useState<string>('')
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
-
-  // Bot selector
   const [bot, setBot] = useState<BotKey>('FB1')
+  const [sessionId, setSessionId] = useState<string>('')
 
-  // NEW: session id (regenerated on Refresh)
-  const [sessionId, setSessionId] = useState<string>('') // NEW
+  const endRef = useRef<HTMLDivElement | null>(null)
 
-  // API base (configurable via .env.local -> NEXT_PUBLIC_API_BASE)
+  // API base
   const apiBaseFromEnv =
-    typeof process !== 'undefined'
-      ? (process as any).env?.NEXT_PUBLIC_API_BASE
-      : undefined
+    typeof process !== 'undefined' ? (process as any).env?.NEXT_PUBLIC_API_BASE : undefined
   const apiBase = (apiBaseFromEnv || 'http://localhost:8000').replace(/\/$/, '')
 
-  // Mount gate toggled after first client render
   useEffect(() => setMounted(true), [])
 
-  // NEW: create a fresh session id on first mount
+  // Create session id on first mount
   useEffect(() => {
     if (!sessionId) {
       const id =
@@ -54,7 +43,7 @@ export default function ChatPage() {
     }
   }, [sessionId])
 
-  // Load MathJax once on client
+  // Load MathJax once
   useEffect(() => {
     if (!window.MathJax) {
       const s = document.createElement('script')
@@ -64,10 +53,18 @@ export default function ChatPage() {
     }
   }, [])
 
-  // Re-typeset after messages change
+  // Re-typeset after message updates
   useEffect(() => {
     window.MathJax?.typeset?.()
   }, [messages])
+
+  // Auto-scroll to bottom of the answers panel
+  useEffect(() => {
+    const t = setTimeout(() => {
+      endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    }, 80)
+    return () => clearTimeout(t)
+  }, [messages, loading])
 
   if (!mounted) return null
 
@@ -77,27 +74,20 @@ export default function ChatPage() {
 
     setError(null)
     setLoading(true)
-
-    const userMsg: Message = { role: 'user', content: question }
-    setMessages(prev => [...prev, userMsg])
+    setMessages(prev => [...prev, { role: 'user', content: question }])
     setInput('')
 
     try {
-      // Use generic endpoint with target selector + session_id (NEW)
       const url = `${apiBase}/chat`
-      const res = await axios.post(url, { question, target: bot, session_id: sessionId }) // NEW
+      const res = await axios.post(url, { question, target: bot, session_id: sessionId })
       const answer: string = res?.data?.answer ?? ''
-      const assistantMsg: Message = {
-        role: 'assistant',
-        content: answer || '(no answer returned)',
-      }
-      setMessages(prev => [...prev, assistantMsg])
+      setMessages(prev => [...prev, { role: 'assistant', content: answer || '(no answer returned)' }])
     } catch (e: any) {
       console.error(e)
       setError(e?.message || 'Request failed')
       setMessages(prev => [
         ...prev,
-        { role: 'assistant', content: 'Sorry — I ran into a problem fetching the answer.' },
+        { role: 'assistant', content: 'Entschuldigung – beim Abrufen der Antwort ist ein Problem aufgetreten.' },
       ])
     } finally {
       setLoading(false)
@@ -108,14 +98,10 @@ export default function ChatPage() {
     if (e.key === 'Enter') ask()
   }
 
-  // NEW: Refresh button handler — clears memory on server and starts a new session
   const refreshSession = async () => {
     try {
-      await axios.post(`${apiBase}/session/reset`, null, {
-        params: { session_id: sessionId },
-      })
-    } catch (e) {
-      // Even if reset fails, we still rotate the client session to avoid stale context
+      await axios.post(`${apiBase}/session/reset`, null, { params: { session_id: sessionId } })
+    } catch {
       console.warn('Session reset failed; rotating client session anyway.')
     } finally {
       const newId =
@@ -123,18 +109,18 @@ export default function ChatPage() {
           ? crypto.randomUUID()
           : `${Date.now()}-${Math.random().toString(36).slice(2)}`
       setSessionId(newId)
-      setMessages([]) // optional: start with a clean chat view
+      setMessages([])
       setError(null)
     }
   }
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-blue-50 to-white">
-      <div className="max-w-3xl mx-auto px-4 py-10">
+      <div className="mx-auto max-w-3xl px-4 py-6">
+        {/* Header */}
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-semibold text-gray-800">Chatbot Assistant</h1>
+          <h1 className="text-2xl font-semibold text-gray-800">SKiLLs Chatbot Assistant</h1>
 
-          {/* Bot selector */}
           <div className="ml-auto flex items-center gap-2">
             <label htmlFor="bot" className="text-sm text-gray-600">model:</label>
             <select
@@ -143,14 +129,12 @@ export default function ChatPage() {
               onChange={(e) => setBot(e.target.value as BotKey)}
               className="px-3 py-2 border rounded-lg bg-white text-sm"
               disabled={loading}
-              aria-label="Select document bot"
             >
               <option value="FB1">FB1</option>
               <option value="FB2">FB2</option>
               <option value="FB3">FB3</option>
             </select>
 
-            {/* NEW: Refresh (clears server-side session memory) */}
             <button
               onClick={refreshSession}
               disabled={loading}
@@ -162,47 +146,66 @@ export default function ChatPage() {
           </div>
         </div>
 
-        {/* NEW: tiny session badge (optional, helps debug) */}
+        {/* Session badge */}
         <div className="mt-2 text-[11px] text-gray-500 select-all">
           session: <span className="font-mono">{sessionId || '—'}</span>
         </div>
 
-        <div className="mt-6 flex items-center gap-3">
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={onKeyDown}
-            placeholder={`Ask a question to ${bot}…`}
-            className="flex-1 p-3 border border-blue-300 rounded-xl shadow-sm bg-white text-[15px] leading-6 focus:outline-none focus:ring-2 focus:ring-blue-400"
-          />
-          <button
-            onClick={ask}
-            disabled={loading || !input.trim()}
-            className="px-4 py-2 rounded-xl bg-blue-600 text-white disabled:opacity-50"
-          >
-            {loading ? 'I am Thinking…' : 'Ask'}
-          </button>
-        </div>
+        {/* ===== PAGE BODY: two rows (answers / input) ===== */}
+        <div className="mt-4 h-[calc(100vh-170px)] grid grid-rows-[1fr_auto] gap-2">
+          {/* Top: Answers panel (scrollable) */}
+          <div className="overflow-y-auto rounded-xl border border-gray-200 bg-white p-4">
+            {error && <div className="mb-4 text-sm text-red-600">{error}</div>}
 
-        {error && <div className="mt-3 text-sm text-red-600">{error}</div>}
-
-        <div className="mt-8 space-y-6">
-          {messages.map((m, idx) => (
-            <div
-              key={idx}
-              className={`p-4 rounded-xl shadow-sm ${
-                m.role === 'user' ? 'bg-white border border-gray-200' : 'bg-blue-50 border border-blue-100'
-              }`}
-            >
-              <div className="text-xs uppercase tracking-wide mb-2 text-gray-500">
-                {m.role === 'user' ? 'You' : `Assistant (${bot})`}
+            {messages.length === 0 && (
+              <div className="text-sm text-gray-500">
+                Fragen Sie mich alles aus dem Vorlesungsunterlagen.
               </div>
-              {/* Render as plain text; MathJax still parses TeX from text nodes */}
-              <p className="text-sm whitespace-pre-wrap">{m.content?.trim?.() ?? ''}</p>
+            )}
+
+            <div className="space-y-4">
+              {messages.map((m, idx) => (
+                <div
+                  key={idx}
+                  className={`p-4 rounded-xl shadow-sm ${
+                    m.role === 'user'
+                      ? 'bg-white border border-gray-200'
+                      : 'bg-blue-50 border border-blue-100'
+                  }`}
+                >
+                  <div className="text-xs uppercase tracking-wide mb-2 text-gray-500">
+                    {m.role === 'user' ? 'You' : `Assistant (${bot})`}
+                  </div>
+                  <p className="text-sm whitespace-pre-wrap">{m.content?.trim?.() ?? ''}</p>
+                </div>
+              ))}
+              {/* scroll target */}
+              <div ref={endRef} />
             </div>
-          ))}
+          </div>
+
+          {/* Bottom: Input panel (stays at bottom, not overlay) */}
+          <div className="rounded-xl border border-blue-200 bg-white p-3 shadow-sm">
+            <div className="flex items-center gap-3">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={onKeyDown}
+                placeholder={`Eine Frage stellen an ${bot}…`}
+                className="flex-1 p-3 border border-blue-200 rounded-lg bg-white text-[15px] leading-6 focus:outline-none focus:ring-2 focus:ring-blue-400"
+              />
+              <button
+                onClick={ask}
+                disabled={loading || !input.trim()}
+                className="px-5 py-3 rounded-lg bg-blue-600 text-white text-sm disabled:opacity-50"
+              >
+                {loading ? 'Denken...' : 'Fragen'}
+              </button>
+            </div>
+          </div>
         </div>
+        {/* ===== END BODY ===== */}
       </div>
     </div>
   )
