@@ -3,7 +3,8 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from app.services.admin_log import log_exchange
-
+from uuid import UUID
+from weaviate import classes as wv
 from app.services.rag import retrieve_answer_with_meta
 from app.services.weaviate_setup import (
     ensure_collections,
@@ -592,43 +593,22 @@ async def export_logs_json(season: str | None = None, limit: int = 2000):
         },
     )
 
-# Add with the other imports at top if needed
-import weaviate as wv
-from app.services.weaviate_setup import client, CHATLOG_CLASS
-
-
-
 
 @app.delete("/admin/logs")
 async def delete_logs(season: str | None = None, confirm: bool = False):
-    """
-    Delete chat logs from the ChatLog collection.
-    - If `season` is provided: delete only that season.
-    - If `season` is omitted: delete ALL seasons (requires `?confirm=true`).
-    Returns a summary with the number of objects deleted (if available).
-    """
     coll = client.collections.get(CHATLOG_CLASS)
 
-
-    # Build filter (optional)
-    flt = None
     if season:
-        flt = wv.classes.query.Filter.by_property("season").equal(season)
-
-
-    # Safety guard for full wipe
-    if flt is None and not confirm:
-        return {"deleted": 0, "ok": False, "error": "Refusing to delete ALL logs without confirm=true"}
-
+        where = wv.classes.query.Filter.by_property("season").equal(season)
+    else:
+        if not confirm:
+            return {"ok": False, "deleted": 0, "error": "Refusing to delete ALL logs without confirm=true"}
+        # ✅ Match-all via an impossible ID
+        where = wv.classes.query.Filter.by_id().not_equal(UUID("00000000-0000-0000-0000-000000000000"))
 
     try:
-        # v4 client supports delete_many with optional filter
-        res = coll.data.delete_many(filters=flt)
-        # Some client versions return an object with .matches or .objects_deleted; normalize:
-        deleted = getattr(res, "objects_deleted", None)
-        if deleted is None:
-            # Fallback (older clients may not return a count). We'll just say ok.
-            deleted = -1
+        res = coll.data.delete_many(where=where)  # v4 requires 'where'
+        deleted = getattr(res, "objects_deleted", -1)
         return {"ok": True, "deleted": deleted, "season": season or "ALL"}
     except Exception as e:
         return {"ok": False, "error": str(e)}

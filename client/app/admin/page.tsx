@@ -8,13 +8,9 @@ export default function AdminLogsPage() {
   const [mounted, setMounted] = useState(false)
   const [authenticated, setAuthenticated] = useState(false)
   const [enteredKey, setEnteredKey] = useState('')
-
-  const [season, setSeason] = useState<string>('')
-  const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [results, setResults] = useState<any[] | null>(null)
-
-  // NEW: delete flow UI
+  const [season, setSeason] = useState<string>('')
   const [deleting, setDeleting] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
 
@@ -67,22 +63,6 @@ export default function AdminLogsPage() {
         </div>
       </div>
     )
-  }
-
-  const search = async () => {
-    setLoading(true)
-    setError(null)
-    setResults(null)
-    try {
-      const res = await fetch(viewUrl, { cache: 'no-store' })
-      if (!res.ok) throw new Error(`Request failed (${res.status})`)
-      const data = await res.json()
-      setResults(Array.isArray(data?.logs) ? data.logs : [])
-    } catch (e: any) {
-      setError(e?.message || 'Search failed')
-    } finally {
-      setLoading(false)
-    }
   }
 
   // NEW: delete action (season-only or ALL)
@@ -166,14 +146,6 @@ export default function AdminLogsPage() {
             >
               Download JSON
             </a>
-            <button
-              onClick={search}
-              disabled={loading}
-              className="px-3 py-2 rounded-lg bg-gray-900 text-white text-sm hover:bg-gray-800 disabled:opacity-50"
-            >
-              {loading ? 'Searching…' : 'Search'}
-            </button>
-
             {/* NEW: Delete button */}
             <button
               onClick={deleteLogs}
@@ -196,19 +168,6 @@ export default function AdminLogsPage() {
             Backend: <code>{apiBase}</code> — endpoints: <code>/admin/logs</code> (GET, DELETE), <code>/admin/logs/export</code> (GET).
           </p>
         </div>
-
-        {error && <div className="text-sm text-red-600 mt-4">{error}</div>}
-
-        {Array.isArray(results) && (
-          <div className="mt-4">
-            <div className="text-sm text-gray-700 mb-2">
-              Found <span className="font-semibold">{results.length}</span> entr{results.length === 1 ? 'y' : 'ies'}
-            </div>
-            <pre className="text-xs bg-gray-50 border border-gray-200 rounded-lg p-3 overflow-auto max-h-[480px]">
-{JSON.stringify(results, null, 2)}
-            </pre>
-          </div>
-        )}
       </div>
     </div>
   )
