@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 
-const ADMIN_PASS = '030697' 
+const ADMIN_PASS = '030697'
 
 export default function AdminLogsPage() {
   const [mounted, setMounted] = useState(false)
@@ -13,6 +13,10 @@ export default function AdminLogsPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [results, setResults] = useState<any[] | null>(null)
+
+  // NEW: delete flow UI
+  const [deleting, setDeleting] = useState(false)
+  const [toast, setToast] = useState<string | null>(null)
 
   // API base
   const apiBaseFromEnv =
@@ -81,6 +85,49 @@ export default function AdminLogsPage() {
     }
   }
 
+  // NEW: delete action (season-only or ALL)
+  const deleteLogs = async () => {
+    const target = season || 'ALL'
+    const ok = window.confirm(
+      season
+        ? `Delete logs for season “${season}”? This cannot be undone.`
+        : `Delete ALL logs? This cannot be undone. Type OK to proceed.`
+    )
+    if (!ok) return
+
+    try {
+      setDeleting(true)
+      setToast(null)
+      setError(null)
+
+      const url = season
+        ? `${apiBase}/admin/logs?season=${encodeURIComponent(season)}`
+        : `${apiBase}/admin/logs?confirm=true`
+
+      const res = await fetch(url, { method: 'DELETE' })
+      const data = await res.json()
+
+      if (!res.ok || data?.ok === false) {
+        throw new Error(data?.error || `Delete failed (${res.status})`)
+      }
+
+      setToast(
+        data?.deleted === -1
+          ? `Deleted logs for ${data?.season || target}.`
+          : `Deleted ${data?.deleted ?? 0} log(s) for ${data?.season || target}.`
+      )
+
+      // Clear current view results since they may no longer exist
+      setResults(null)
+    } catch (e: any) {
+      setToast(e?.message || 'Delete failed')
+    } finally {
+      setDeleting(false)
+      // auto-hide toast
+      setTimeout(() => setToast(null), 4000)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-gray-50 to-white">
       <div className="max-w-4xl mx-auto px-4 py-10">
@@ -126,10 +173,27 @@ export default function AdminLogsPage() {
             >
               {loading ? 'Searching…' : 'Search'}
             </button>
+
+            {/* NEW: Delete button */}
+            <button
+              onClick={deleteLogs}
+              disabled={deleting}
+              className="px-3 py-2 rounded-lg bg-red-600 text-white text-sm hover:bg-red-700 disabled:opacity-50"
+              title={season ? `Delete ${season}` : 'Delete ALL logs'}
+            >
+              {deleting ? 'Deleting…' : (season ? `Delete ${season}` : 'Delete ALL')}
+            </button>
           </div>
 
+          {/* NEW: toast */}
+          {toast && (
+            <div className="mt-3 inline-block rounded-md bg-gray-900 text-white text-sm px-3 py-2">
+              {toast}
+            </div>
+          )}
+
           <p className="mt-3 text-xs text-gray-500">
-            Backend: <code>{apiBase}</code> — endpoints: <code>/admin/logs</code>, <code>/admin/logs/export</code>.
+            Backend: <code>{apiBase}</code> — endpoints: <code>/admin/logs</code> (GET, DELETE), <code>/admin/logs/export</code> (GET).
           </p>
         </div>
 
